@@ -164,29 +164,41 @@ async function pickGeminiModel(F, key) {
   const score = m => { const v = parseFloat((m.name.match(/gemini-(\d+(?:\.\d+)?)/) || [0, 0])[1]); return (/preview/i.test(m.name) ? 0 : 1000) + v * 10 - (/lite/i.test(m.name) ? 1 : 0); };   // stable before preview, newest first
   return list.sort((a, b) => score(b) - score(a)).map(m => m.name);
 }
-async function askGemini(F, key, models, system, prompt, log) {
-  let last = "";
-  for (const name of models.slice(0, 3)) {                   // busy / slow model → the next one
+// Google counts the free allowance per project AND per model: when one model's limit is reached, the others may still have
+// theirs. `used` remembers, for this run, which models are spent (daily) or resting (per-minute), so they are skipped.
+async function askGemini(F, key, models, system, prompt, log, used = new Map()) {
+  let last = "", fails = 0;
+  const short = n => n.replace(/^models\//, "");
+  const resting = n => { const u = used.get(n); return u === "day" || (typeof u === "number" && u > Date.now()); };
+  for (const name of models) {
+    if (resting(name)) continue;
+    if (fails >= 3) break;                                   // three slow / busy answers in a row: leave it for now
+    let quotaHit = false;
     for (const think of [true, false]) {                     // ask for no long "thinking" (much faster); older models may not accept that setting
       const t0 = Date.now(); let r;
       const gc = { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192, ...(think ? { thinkingConfig: { thinkingBudget: 0 } } : {}) };
       try { r = await F(`https://generativelanguage.googleapis.com/v1beta/${name}:generateContent`, { method: "POST", signal: AbortSignal.timeout(110000),
         headers: { "content-type": "application/json", "x-goog-api-key": key },
         body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: gc }) }); }
-      catch (e) { last = `${name.replace(/^models\//, "")}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); break; }
+      catch (e) { last = `${short(name)}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); fails++; break; }
       const txt = await r.text();
-      if (r.status === 429) { const e = new Error("Gemini free limit reached"); e.quota = true; e.daily = /per ?day|PerDay|daily/i.test(txt); throw e; }   // per-minute limits clear in a minute; daily ones at midnight Pacific
+      if (r.status === 429) {                                // this model's free limit: per day (resets midnight Pacific) or per minute
+        const daily = /per ?day|PerDay|daily/i.test(txt); used.set(name, daily ? "day" : Date.now() + 61000); quotaHit = true;
+        last = `${short(name)}: free ${daily ? "daily" : "per-minute"} limit reached`; log && log(`    ${last} — trying the next model`); break; }
       if (r.status === 400 && think) continue;
       if (!r.ok) { let m = ""; try { m = JSON.parse(txt).error.message; } catch (e) { m = txt; }
-        last = `${name.replace(/^models\//, "")}: HTTP ${r.status}${r.status === 503 ? " (Google busy)" : ""} ${String(m || "").replace(/\s+/g, " ").slice(0, 90)}`; log && log("    " + last); break; }
+        last = `${short(name)}: HTTP ${r.status}${r.status === 503 ? " (Google busy)" : ""} ${String(m || "").replace(/\s+/g, " ").slice(0, 90)}`; log && log("    " + last); fails++; break; }
       try { const j = JSON.parse(txt); const out = ((j.candidates || [])[0] || {}).content; const t = ((out && out.parts) || []).map(p => p.text || "").join("");
-        if (t) { log && log(`    ${name.replace(/^models\//, "")} answered in ${Math.round((Date.now() - t0) / 1000)}s`);
+        if (t) { log && log(`    ${short(name)} answered in ${Math.round((Date.now() - t0) / 1000)}s`);
           const k = models.indexOf(name); if (k > 0) { models.splice(k, 1); models.unshift(name); }      // keep using the model that answered
-          return { model: name.replace(/^models\//, ""), text: t }; } last = name + ": empty answer"; }
+          return { model: short(name), text: t }; } last = name + ": empty answer"; }
       catch (e) { last = name + ": unreadable answer"; }
-      break;
+      fails++; break;
     }
+    if (quotaHit) continue;
   }
+  if (models.length && models.every(resting)) {               // every model has reached its free limit
+    const e = new Error("Gemini free limit reached on every model"); e.quota = true; e.daily = models.every(n => used.get(n) === "day"); throw e; }
   throw new Error(last || "Gemini unavailable");
 }
 
@@ -227,7 +239,7 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
   queue.sort((a, b) => when(b) - when(a) || rank(a.type) - rank(b.type));
   const kinds = {}; queue.forEach(d => { const k = d.type.replace(/ \d.*$/, ""); kinds[k] = (kinds[k] || 0) + 1; });
   log(`Documents: ${queue.length} new to read for your watchlist (${Object.entries(kinds).map(([k, n]) => `${n} ${k.toLowerCase()}`).join(", ")}).`);
-  let gModels = null, geminiOff = !geminiKey, cfOff = false, cfFails = 0;
+  let gModels = null, geminiOff = !geminiKey, cfOff = false, cfFails = 0; const gUsed = new Map();
   for (const d of queue.slice(0, maxDocs)) {
     if (Date.now() > until - 90000) break;
     const r = await (pdfGet || nse)(d.doc, 180000);           // big PDFs: allow up to 3 minutes
@@ -247,13 +259,13 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
     if (!geminiOff) {
       try { if (!gModels) { gModels = await pickGeminiModel(F, geminiKey);
           const fast = tg.model && gModels.indexOf("models/" + String(tg.model).replace(/^models\//, "")); if (fast > 0) gModels.unshift(gModels.splice(fast, 1)[0]);   // the model that answered last time goes first
-          log(`  Gemini models available: ${gModels.slice(0, 3).map(m => m.replace(/^models\//, "")).join(", ")}`); } ans = await askGemini(F, geminiKey, gModels, system, prompt, log); await sleep(7000); }
+          log(`  Gemini models available (${gModels.length}): ${gModels.slice(0, 5).map(m => m.replace(/^models\//, "")).join(", ")}${gModels.length > 5 ? ", …" : ""}`); } ans = await askGemini(F, geminiKey, gModels, system, prompt, log, gUsed); await sleep(7000); }
       catch (e) { why = String(e.message || e);
         if (e.quota && !e.daily && Date.now() < until - 4 * 60e3) {             // a per-minute limit: wait a minute and try once more
           log("  Gemini's per-minute free limit reached — waiting a minute."); await sleep(62000);
-          try { ans = await askGemini(F, geminiKey, gModels, system, prompt, log); await sleep(7000); } catch (e2) { why = String(e2.message || e2); if (e2.quota) e.daily = true; }
+          try { ans = await askGemini(F, geminiKey, gModels, system, prompt, log, gUsed); await sleep(7000); } catch (e2) { why = String(e2.message || e2); if (e2.quota) e.daily = true; }
         }
-        if (!ans && e.quota) { geminiOff = true; log(`  Gemini's free ${e.daily ? "daily" : ""} limit is used up for now — switching to Cloudflare AI.`.replace("  ", " ").replace(/^ /, "  ")); } }
+        if (!ans && e.quota) { geminiOff = true; log(`  Every Gemini model has used its free${e.daily ? " daily" : ""} limit for now — switching to Cloudflare AI.`); } }
     }
     if (!ans && !cfOff) { const t0 = Date.now();
       const small = buildPrompt(d.name, d.symbol, d.type, d.date, selectPages(pages, 14000));   // Cloudflare's models are slower: a shorter extract

@@ -134,6 +134,12 @@ export async function run(o = {}) {
     } catch (e) { log("Documents step skipped: " + (e.message || e)); }
   }
 
+  // 1c) company info for the Key ratios block (shareholding, pledges, face value; industries weekly) — a few small requests
+  if (!o.skipCompanyInfo && !(o.fetch && !o.companyInfo) && Date.now() < until - 90000) {   // (tests with a stand-in fetch test it separately)
+    try { const { runCompanyInfo } = await import("./companyinfo.mjs"); await runCompanyInfo({ trex, nse, log, until }); }
+    catch (e) { log("Company info step skipped: " + (e.message || e)); }
+  }
+
   // 2) XBRL files, a few at a time
   const seen = new Set(); let blocks = 0, stop = false; const touched = new Set();
   while (!stop && Date.now() < until && budget > 50) {

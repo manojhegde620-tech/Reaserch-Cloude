@@ -175,7 +175,7 @@ async function askGemini(F, key, models, system, prompt, log) {
         body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: gc }) }); }
       catch (e) { last = `${name.replace(/^models\//, "")}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); break; }
       const txt = await r.text();
-      if (r.status === 429) { const e = new Error("Gemini free limit reached"); e.quota = true; throw e; }
+      if (r.status === 429) { const e = new Error("Gemini free limit reached"); e.quota = true; e.daily = /per ?day|PerDay|daily/i.test(txt); throw e; }   // per-minute limits clear in a minute; daily ones at midnight Pacific
       if (r.status === 400 && think) continue;
       if (!r.ok) { let m = ""; try { m = JSON.parse(txt).error.message; } catch (e) { m = txt; }
         last = `${name.replace(/^models\//, "")}: HTTP ${r.status}${r.status === 503 ? " (Google busy)" : ""} ${String(m || "").replace(/\s+/g, " ").slice(0, 90)}`; log && log("    " + last); break; }
@@ -227,7 +227,7 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
   queue.sort((a, b) => when(b) - when(a) || rank(a.type) - rank(b.type));
   const kinds = {}; queue.forEach(d => { const k = d.type.replace(/ \d.*$/, ""); kinds[k] = (kinds[k] || 0) + 1; });
   log(`Documents: ${queue.length} new to read for your watchlist (${Object.entries(kinds).map(([k, n]) => `${n} ${k.toLowerCase()}`).join(", ")}).`);
-  let gModels = null, geminiOff = !geminiKey;
+  let gModels = null, geminiOff = !geminiKey, cfOff = false, cfFails = 0;
   for (const d of queue.slice(0, maxDocs)) {
     if (Date.now() > until - 90000) break;
     const r = await (pdfGet || nse)(d.doc, 180000);           // big PDFs: allow up to 3 minutes
@@ -248,11 +248,20 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
       try { if (!gModels) { gModels = await pickGeminiModel(F, geminiKey);
           const fast = tg.model && gModels.indexOf("models/" + String(tg.model).replace(/^models\//, "")); if (fast > 0) gModels.unshift(gModels.splice(fast, 1)[0]);   // the model that answered last time goes first
           log(`  Gemini models available: ${gModels.slice(0, 3).map(m => m.replace(/^models\//, "")).join(", ")}`); } ans = await askGemini(F, geminiKey, gModels, system, prompt, log); await sleep(7000); }
-      catch (e) { why = String(e.message || e); if (e.quota) { geminiOff = true; log("  Gemini's free limit is used up for now — switching to Cloudflare AI."); } }
+      catch (e) { why = String(e.message || e);
+        if (e.quota && !e.daily && Date.now() < until - 4 * 60e3) {             // a per-minute limit: wait a minute and try once more
+          log("  Gemini's per-minute free limit reached — waiting a minute."); await sleep(62000);
+          try { ans = await askGemini(F, geminiKey, gModels, system, prompt, log); await sleep(7000); } catch (e2) { why = String(e2.message || e2); if (e2.quota) e.daily = true; }
+        }
+        if (!ans && e.quota) { geminiOff = true; log(`  Gemini's free ${e.daily ? "daily" : ""} limit is used up for now — switching to Cloudflare AI.`.replace("  ", " ").replace(/^ /, "  ")); } }
     }
-    if (!ans) { const t0 = Date.now(); const c = await trex("ai", {}, JSON.stringify({ system, prompt }));
-      if (c && c.ok) { ans = { model: c.model, text: c.text }; log(`    Cloudflare AI (${String(c.model).replace(/^@cf\//, "")}) answered in ${Math.round((Date.now() - t0) / 1000)}s`); }
-      else { const ce = "Cloudflare AI: " + String((c && c.error) || "no answer").slice(0, 160); log("    " + ce); why += (why ? " | " : "") + ce; } }
+    if (!ans && !cfOff) { const t0 = Date.now();
+      const small = buildPrompt(d.name, d.symbol, d.type, d.date, selectPages(pages, 14000));   // Cloudflare's models are slower: a shorter extract
+      const c = await trex("ai", {}, JSON.stringify(small));
+      if (c && c.ok) { cfFails = 0; ans = { model: c.model, text: c.text }; log(`    Cloudflare AI (${String(c.model).replace(/^@cf\//, "")}) answered in ${Math.round((Date.now() - t0) / 1000)}s`); }
+      else { cfFails++; const ce = "Cloudflare AI: " + String((c && c.error) || "no answer").slice(0, 160); log("    " + ce); why += (why ? " | " : "") + ce;
+        if (geminiOff && cfFails >= 2) { cfOff = true; log("  Both AIs are unavailable right now — the remaining documents wait for the next run."); } } }
+    if (!ans && cfOff && geminiOff) { await trex("insights", {}, JSON.stringify({ ...d, status: 0, transient: true, note: (why || "AI unavailable").slice(0, 190) })); break; }
     // the AI being busy is not the document's fault: it is tried again next run and does not count towards giving up on it
     if (!ans) { await trex("insights", {}, JSON.stringify({ ...d, status: 0, transient: true, note: why.slice(0, 190) })); log(`  ${d.symbol}: no AI available right now — will retry next run`); continue; }
     const raw = parseFacts(ans.text);

@@ -233,7 +233,9 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
     const r = await (pdfGet || nse)(d.doc, 180000);           // big PDFs: allow up to 3 minutes
     if (r.code !== 200 || !r.body || r.body.length < 1000) { log(`  ${d.symbol}: could not download ${d.type} (${r.code ? "HTTP " + r.code : r.why || "no answer"})`); continue; }
     if (r.body.length > 40 * 1024 * 1024) { await trex("insights", {}, JSON.stringify({ ...d, status: 2, note: "file too large" })); continue; }
-    let pages = []; try { pages = await pdfText(r.body); } catch (e) { log(`  ${d.symbol}: PDF text could not be read (${e.message || e})`); continue; }
+    let pages = []; try { pages = await pdfText(r.body); } catch (e) {               // damaged PDF: tried again on the next runs, given up after 3
+      await trex("insights", {}, JSON.stringify({ ...d, status: 0, note: "PDF damaged or incomplete: " + String(e.message || e).split("\n").find(x => /error/i.test(x) && !/^Command/.test(x))?.slice(0, 120) }));
+      log(`  ${d.symbol}: ${d.type} — the PDF file is damaged or incomplete; will try again (gives up after 3 tries)`); continue; }
     if (pages.join("").replace(/\s/g, "").length < 120) { await trex("insights", {}, JSON.stringify({ ...d, status: 2, note: "no text in PDF (scanned images)" })); log(`  ${d.symbol}: ${d.type} is scanned images — skipped`); continue; }
     if (!/presentation|annual report/i.test(d.type) && pages.filter(p => p.trim().length > 200).length <= 2 && pages.join("").length < 5000) {   // only a covering letter / link to the website
       await trex("insights", {}, JSON.stringify({ ...d, status: 1, items: [], model: "", note: "covering letter only — the document itself is on the company's website" })); log(`  ${d.symbol}: ${d.type} is only a covering letter — skipped`); continue; }

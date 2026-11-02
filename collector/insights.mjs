@@ -274,7 +274,7 @@ export const claudePrice = m => /haiku-5/i.test(m) ? [0.10, 0.50] : /haiku/i.tes
 export const claudeCost = st => st.cost != null ? st.cost : ((st.inTok || 0) * 0.10 + (st.outTok || 0) * 0.50) / 1e6;
 
 // main: called from collect.mjs with its NSE session + T-Rex helpers
-export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiKey, claudeKey = process.env.ANTHROPIC_API_KEY || "", fetch: F = globalThis.fetch, pdfText = pdfTextPoppler, maxDocs = 6, extra = "", publicLog = process.env.TREX_PUBLIC_LOG === "1" }) {
+export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiKey, claudeKey = process.env.ANTHROPIC_API_KEY || "", fetch: F = globalThis.fetch, pdfText = pdfTextPoppler, maxDocs = 6, extra = "", publicLog = process.env.TREX_PUBLIC_LOG === "1", geminiKey2 = process.env.GEMINI_KEY_2 || "" }) {
   const stats = { docs: 0, facts: 0, model: {} };
   const tg = await trex("aitargets", extra ? { extra } : {});
   // public repository: its run logs can be read by anyone, so your watchlist company names are hidden in them
@@ -310,6 +310,7 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
   queue.sort((a, b) => when(b) - when(a) || rank(a.type) - rank(b.type));
   const kinds = {}; queue.forEach(d => { const k = d.type.replace(/ \d.*$/, ""); kinds[k] = (kinds[k] || 0) + 1; });
   log(`Documents: ${queue.length} new to read for your watchlist (${Object.entries(kinds).map(([k, n]) => `${n} ${k.toLowerCase()}`).join(", ")}).`);
+  if (!geminiKey && geminiKey2) geminiKey = geminiKey2;
   let gModels = null, geminiOff = !geminiKey, cfOff = false, cfFails = 0, claudeOff = !claudeKey; const gUsed = new Map(), cSt = {};
   for (const d of queue.slice(0, maxDocs)) {
     if (Date.now() > until - 90000) break;
@@ -340,6 +341,9 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
           log("  Gemini's per-minute free limit reached — waiting a minute."); await sleep(62000);
           try { ans = await askGemini(F, geminiKey, gModels, system, prompt, log, gUsed); await sleep(7000); } catch (e2) { why = String(e2.message || e2); if (e2.quota) e.daily = true; }
         }
+        if (!ans && e.quota && geminiKey2 && geminiKey !== geminiKey2) {      // a second Gemini key (GEMINI_KEY_2): carry on with it
+          geminiKey = geminiKey2; gModels = null; gUsed.clear(); log("  First Gemini key has used its limit — continuing with the second key.");
+          try { gModels = await pickGeminiModel(F, geminiKey); ans = await askGemini(F, geminiKey, gModels, system, prompt, log, gUsed); await sleep(7000); } catch (e3) { why = String(e3.message || e3); if (e3.quota) e.daily = e3.daily; } }
         if (!ans && e.quota) { geminiOff = true; log(`  Every Gemini model has used its free${e.daily ? " daily" : ""} limit for now — switching to Cloudflare AI.`); } }
     }
     if (!ans && !cfOff) { const t0 = Date.now();

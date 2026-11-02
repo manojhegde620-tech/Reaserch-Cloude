@@ -250,14 +250,14 @@ export async function runDeep(o = {}) {
       Object.assign(ix.companies[sym], { ripe: ripeCount(co), jt: co.jt || Date.now(), jr: JUDGE_RULES }); saveCo(sym, co); jn += (co.judged || 0) - before; }
     if (due.length) log(`Deep reading: promises checked for ${Math.min(due.length, jn ? due.length : due.length)} compan${due.length === 1 ? "y" : "ies"} — ${jn} verdicts.`); }
   // then: tidy-up of companies read earlier (once), and of your watchlist companies twice a day — several at once
-  let tidyLeft = 0;
+  let tidyLeft = 0, tidyDone = 0;
   { const tUntil = Math.min(until - 120000, Date.now() + (o.tidyMinutes ?? 12) * 60e3); let tn = 0, tc = 0;
     const due = Object.entries(ix.companies).filter(([s, c]) => c && c.v >= DEEP_VERSION && c.t && (c.tv !== TIDY_VERSION || (watchSet.has(s) && Date.now() - (c.tdt || 0) > 12 * 3600e3)))
       .map(([s]) => s).sort((a, b) => (order.get(a) ?? 9e9) - (order.get(b) ?? 9e9));
     let nx = 0; const tw = async () => { while (!stopRun && Date.now() < tUntil) { const sym = due[nx++]; if (sym === undefined) break;
       try { const co = loadCo(sym); tn += (await tidyCo(sym, co)) || 0; if (co.tv === TIDY_VERSION) { Object.assign(ix.companies[sym], { tv: co.tv, tdt: co.tdt }); saveCo(sym, co); tc++; } } catch (e) {} } };
     await Promise.all(Array.from({ length: Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4) }, tw));
-    tidyLeft = due.length - tc;
+    tidyLeft = due.length - tc; tidyDone = tc;
     if (due.length) { log(`Deep reading: tidied ${tc} of ${due.length} companies waiting (${tn} number names given a standard name).`); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); if (tc) publish(`tidy-up: ${tc} companies`); } }
   // several companies at once (each still reads its documents one by one); NSE requests stay spaced out
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);
@@ -269,7 +269,10 @@ export async function runDeep(o = {}) {
   const total = tg.symbols.length, have = Object.keys(ix.companies).length;
   log(`Deep reading: ${cos} companies, ${docs} documents, ${facts} checked facts this run · ${have} of ${total} companies done · Claude cost so far ≈ $${ix.spent.toFixed(2)} (this run ≈ $${claudeCost(st).toFixed(2)}).`);
   // more to read and this run made progress → tell the workflow to start the next run straight away (no waiting for the clock)
-  if (!o.skipGit && !ix.keyDead && ix.spent < cap && ((docs >= 5 && Object.values(ix.companies).filter(c => c.v >= DEEP_VERSION && c.t).length < total) || tidyLeft > 20)) { try { writeFileSync(join(tmpdir(), "trex-deep-more"), "1"); } catch (e) {} }
+  if (!o.skipGit && !ix.keyDead && ix.spent < cap && (Object.values(ix.companies).filter(c => c.v >= DEEP_VERSION && c.t).length < total || tidyLeft > 0)) {
+    // GitHub's hourly timer is unreliable for this repository, so each run starts the next one; a run that got nothing done
+    // (NSE refusing, Claude busy) asks the workflow to wait 15 minutes first
+    try { writeFileSync(join(tmpdir(), "trex-deep-more"), "1"); if (docs === 0 && !tidyDone) writeFileSync(join(tmpdir(), "trex-deep-wait"), "1"); } catch (e) {} }
   return { ok: true, companies: cos, docs, facts, spent: ix.spent, have, total };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) runDeep().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(0); });

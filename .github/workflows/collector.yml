@@ -7,7 +7,7 @@ on:
     - cron: "23 */2 * * *"      # every 2 hours (UTC). GitHub sometimes skips scheduled runs, so they are frequent and short
   workflow_dispatch:            # "Run workflow" button for a manual run
 permissions:
-  contents: read
+  contents: write      # only to publish the public market-data copy to the gh-pages branch of this repository
 concurrency:
   group: trex-collector
   cancel-in-progress: false
@@ -30,3 +30,10 @@ jobs:
           TREX_MAX_MINUTES: "25"
           TREX_MONTH_MINUTES: "100000"   # public repository: GitHub minutes are free and unlimited
           TREX_PUBLIC_LOG: "1"           # logs are public: hide watchlist company names
+      - name: Publish the market-data copy (GitHub mirror, gh-pages branch)
+        if: always()
+        run: node collector/mirror.mjs
+        env:
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TREX_MIRROR_MINUTES: "12"

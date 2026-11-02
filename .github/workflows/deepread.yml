@@ -30,5 +30,6 @@ jobs:
           TREX_KEY: ${{ secrets.TREX_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           TREX_DEEP_MINUTES: "45"
+          TREX_DEEP_PARALLEL: "6"         # companies read at the same time
           TREX_CLAUDE_BUDGET_USD: "150"   # never spend more than this in total (the Ultra plan includes $200 of API credit a month)
           TREX_PUBLIC_LOG: "1"

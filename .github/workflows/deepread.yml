@@ -5,7 +5,7 @@
 name: T-Rex deep reading (Claude)
 on:
   schedule:
-    - cron: "53 */2 * * *"      # every 2 hours (UTC)
+    - cron: "53 * * * *"        # every hour (UTC); each run reads for ~45 min, then the next one carries on
   workflow_dispatch:
 permissions:
   contents: write      # only to save the results in the deep-data branch of this repository

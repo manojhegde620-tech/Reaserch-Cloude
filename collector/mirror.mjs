@@ -54,6 +54,7 @@ export async function runMirror(o = {}) {
   if (!lr || !lr.ok) { log("Mirror: T-Rex problem: " + (lr && lr.error)); return { ok: false }; }
   // whole-market table (default order) + database progress — every 6 hours (each page is a big database query)
   await save("/api/db?stats=1");
+  await save("/api/db?world=1");                                   // World watch (public data only)
   if (!man.screenT || Date.now() - man.screenT > 6 * 3600e3) { man.screenT = Date.now();
   for (const v of ["consolidated", "standalone"]) for (let p = 0; p < 30 && Date.now() < until; p++) {
     const base = { screen: "1", view: v, sort: "mcap", dir: "desc", page: String(p) };

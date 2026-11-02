@@ -34,7 +34,9 @@ export async function runCompanyInfo({ trex, nse, log, until, publicLog = proces
   if (tg.industriesDue && Date.now() < until - 60e3) {
     const rows = [];
     for (const f of ["ind_niftytotalmarket_list.csv", "ind_niftymicrocap250_list.csv"]) {
-      const r = await nse(`https://www.niftyindices.com/IndexConstituent/${f}`, 40000);
+      // NSE's own archive first (reachable from GitHub); niftyindices.com as the second way (it times out from GitHub)
+      let r = await nse(`https://nsearchives.nseindia.com/content/indices/${f}`, 40000);
+      if (r.code !== 200 || !r.body || r.body.length < 1000) r = await nse(`https://www.niftyindices.com/IndexConstituent/${f}`, 40000);
       if (r.code !== 200 || !r.body) { log(`  Industry list ${f}: HTTP ${r.code}`); continue; }
       const lines = r.body.toString("utf8").split(/\r?\n/); const h = (lines.shift() || "").split(",").map(x => x.trim().toLowerCase());
       const iS = h.indexOf("symbol"), iI = h.indexOf("industry"); if (iS < 0 || iI < 0) continue;

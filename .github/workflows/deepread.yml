@@ -8,7 +8,8 @@ on:
     - cron: "53 * * * *"        # every hour (UTC); each run reads for ~45 min, then the next one carries on
   workflow_dispatch:
 permissions:
-  contents: write      # only to save the results in the deep-data branch of this repository
+  contents: write      # to save the results in the deep-data branch of this repository
+  actions: write       # to start the next reading run straight away while companies remain
 concurrency:
   group: trex-deep
   cancel-in-progress: false
@@ -33,3 +34,8 @@ jobs:
           TREX_DEEP_PARALLEL: "6"         # companies read at the same time
           TREX_CLAUDE_BUDGET_USD: "150"   # never spend more than this in total (the Ultra plan includes $200 of API credit a month)
           TREX_PUBLIC_LOG: "1"
+      - name: Start the next run if companies remain
+        if: always()
+        run: if [ -f /tmp/trex-deep-more ]; then gh workflow run deepread.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Nothing more to read right now."; fi
+        env:
+          GH_TOKEN: ${{ github.token }}

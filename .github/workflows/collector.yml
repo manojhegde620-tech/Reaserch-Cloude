@@ -33,6 +33,7 @@ jobs:
         env:
           TREX_KEY: ${{ secrets.TREX_KEY }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}   # optional: your Claude API key — read watchlist documents with Claude first
           TREX_MAX_MINUTES: "23"
           TREX_MONTH_MINUTES: "100000"   # public repository: GitHub minutes are free and unlimited
           TREX_PUBLIC_LOG: "1"           # logs are public: hide watchlist company names

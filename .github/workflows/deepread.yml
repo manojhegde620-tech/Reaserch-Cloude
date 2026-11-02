@@ -1,0 +1,34 @@
+# T-Rex one-time deep reading of EVERY listed company with your Claude API key (secret ANTHROPIC_API_KEY).
+# Reads each company's latest annual report, investor presentation and earnings-call transcript once, checks every number
+# and quote on its page, and saves one file per company in the "deep-data" branch (shown in the app's Business · AI tab).
+# Stops by itself when every company is done, when the key ends, or when TREX_CLAUDE_BUDGET_USD is spent.
+name: T-Rex deep reading (Claude)
+on:
+  schedule:
+    - cron: "53 */2 * * *"      # every 2 hours (UTC)
+  workflow_dispatch:
+permissions:
+  contents: write      # only to save the results in the deep-data branch of this repository
+concurrency:
+  group: trex-deep
+  cancel-in-progress: false
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PDF text tool
+        run: sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+      - name: Read company documents with Claude
+        run: node collector/deepread.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TREX_DEEP_MINUTES: "45"
+          TREX_CLAUDE_BUDGET_USD: "150"   # never spend more than this in total (the Ultra plan includes $200 of API credit a month)
+          TREX_PUBLIC_LOG: "1"

@@ -16,7 +16,7 @@ concurrency:
 jobs:
   read:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -36,6 +36,6 @@ jobs:
           TREX_PUBLIC_LOG: "1"
       - name: Start the next run if companies remain
         if: always()
-        run: if [ -f /tmp/trex-deep-more ]; then gh workflow run deepread.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Nothing more to read right now."; fi
+        run: if [ -f /tmp/trex-deep-more ]; then if [ -f /tmp/trex-deep-wait ]; then echo "Nothing got done this run (NSE or Claude busy) - waiting 15 minutes."; sleep 900; fi; gh workflow run deepread.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Nothing more to read right now."; fi
         env:
           GH_TOKEN: ${{ github.token }}

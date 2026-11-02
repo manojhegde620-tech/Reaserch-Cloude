@@ -235,6 +235,8 @@ export async function runDeep(o = {}) {
   publish(`deep reading: ${Object.keys(ix.companies).length} companies`);
   const total = tg.symbols.length, have = Object.keys(ix.companies).length;
   log(`Deep reading: ${cos} companies, ${docs} documents, ${facts} checked facts this run · ${have} of ${total} companies done · Claude cost so far ≈ $${ix.spent.toFixed(2)} (this run ≈ $${claudeCost(st).toFixed(2)}).`);
+  // more to read and this run made progress → tell the workflow to start the next run straight away (no waiting for the clock)
+  if (!o.skipGit && docs >= 5 && !ix.keyDead && ix.spent < cap && Object.values(ix.companies).filter(c => c.v >= DEEP_VERSION && c.t).length < total) { try { writeFileSync(join(tmpdir(), "trex-deep-more"), "1"); } catch (e) {} }
   return { ok: true, companies: cos, docs, facts, spent: ix.spent, have, total };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) runDeep().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(0); });

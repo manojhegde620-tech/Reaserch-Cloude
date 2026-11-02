@@ -202,8 +202,39 @@ async function askGemini(F, key, models, system, prompt, log, used = new Map()) 
   throw new Error(last || "Gemini unavailable");
 }
 
+// Claude (your own Anthropic API key, paid from the plan's monthly API credit): fast and steady. Cheapest suitable model first.
+// Throws with .fatal when the key is missing / expired / out of credit (then the other AIs take over for good).
+export const CLAUDE_MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5"];
+export async function askClaude(F, key, system, prompt, log, st = {}) {
+  let last = "";
+  for (const model of (st.models || CLAUDE_MODELS)) {
+    for (let t = 0; t < 4; t++) {
+      const t0 = Date.now(); let r, txt = "";
+      try { r = await F("https://api.anthropic.com/v1/messages", { method: "POST", signal: AbortSignal.timeout(150000),
+        headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model, max_tokens: 8192, temperature: 0, system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
+      catch (e) { last = `${model}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); await sleep(5000); continue; }
+      let j = null; try { j = JSON.parse(txt); } catch (e) {}
+      const msg = String((j && j.error && j.error.message) || txt).replace(/\s+/g, " ").slice(0, 140);
+      if (r.status === 429 || r.status === 529 || r.status >= 500) {           // busy / rate limit: wait as told, then again
+        const wait = Math.min(60, +(r.headers.get("retry-after") || 0) || 10 * (t + 1)); last = `${model}: HTTP ${r.status} (busy)`; log && log(`    ${last} — waiting ${wait}s`); await sleep(wait * 1000); continue; }
+      if (r.status === 401 || r.status === 403 || (r.status >= 400 && /credit balance|billing|disabled|expired/i.test(msg))) {
+        const e = new Error(`Claude: ${r.status === 401 ? "the API key is not valid any more" : msg}`); e.fatal = true; throw e; }
+      if (r.status === 404 || (r.status === 400 && /model/i.test(msg))) { last = `${model}: not available`; break; }       // try the next model
+      if (!r.ok) { last = `${model}: HTTP ${r.status} ${msg}`; break; }
+      const text = ((j && j.content) || []).filter(c => c.type === "text").map(c => c.text).join("");
+      const u = (j && j.usage) || {}; st.inTok = (st.inTok || 0) + (u.input_tokens || 0); st.outTok = (st.outTok || 0) + (u.output_tokens || 0);
+      if (text) { log && log(`    ${model} answered in ${Math.round((Date.now() - t0) / 1000)}s`); return { model, text }; }
+      last = `${model}: empty answer`; break;
+    }
+  }
+  throw new Error(last || "Claude unavailable");
+}
+// approximate cost in US$ of the tokens used (Haiku 5.5 list price per million tokens: $0.10 in, $0.50 out — check the Claude pricing page)
+export const claudeCost = st => ((st.inTok || 0) * 0.10 + (st.outTok || 0) * 0.50) / 1e6;
+
 // main: called from collect.mjs with its NSE session + T-Rex helpers
-export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiKey, fetch: F = globalThis.fetch, pdfText = pdfTextPoppler, maxDocs = 6, extra = "", publicLog = process.env.TREX_PUBLIC_LOG === "1" }) {
+export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiKey, claudeKey = process.env.ANTHROPIC_API_KEY || "", fetch: F = globalThis.fetch, pdfText = pdfTextPoppler, maxDocs = 6, extra = "", publicLog = process.env.TREX_PUBLIC_LOG === "1" }) {
   const stats = { docs: 0, facts: 0, model: {} };
   const tg = await trex("aitargets", extra ? { extra } : {});
   // public repository: its run logs can be read by anyone, so your watchlist company names are hidden in them
@@ -239,7 +270,7 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
   queue.sort((a, b) => when(b) - when(a) || rank(a.type) - rank(b.type));
   const kinds = {}; queue.forEach(d => { const k = d.type.replace(/ \d.*$/, ""); kinds[k] = (kinds[k] || 0) + 1; });
   log(`Documents: ${queue.length} new to read for your watchlist (${Object.entries(kinds).map(([k, n]) => `${n} ${k.toLowerCase()}`).join(", ")}).`);
-  let gModels = null, geminiOff = !geminiKey, cfOff = false, cfFails = 0; const gUsed = new Map();
+  let gModels = null, geminiOff = !geminiKey, cfOff = false, cfFails = 0, claudeOff = !claudeKey; const gUsed = new Map(), cSt = {};
   for (const d of queue.slice(0, maxDocs)) {
     if (Date.now() > until - 90000) break;
     const r = await (pdfGet || nse)(d.doc, 180000);           // big PDFs: allow up to 3 minutes
@@ -256,7 +287,11 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
     const { system, prompt } = buildPrompt(d.name, d.symbol, d.type, d.date, sel);
     log(`  ${d.symbol}: ${d.type} (${d.date}) — ${pages.length} pages, ${sel.length} sent to the AI`);
     let ans = null, why = "";
-    if (!geminiOff) {
+    if (claudeKey && !claudeOff) {                               // your Claude API key first (when set), then the free AIs
+      try { ans = await askClaude(F, claudeKey, system, prompt, log, cSt); }
+      catch (e) { why = String(e.message || e); if (e.fatal) { claudeOff = true; log(`  ${why} — using Gemini / Cloudflare AI from now on.`); } }
+    }
+    if (!ans && !geminiOff) {
       try { if (!gModels) { gModels = await pickGeminiModel(F, geminiKey);
           const fast = tg.model && gModels.indexOf("models/" + String(tg.model).replace(/^models\//, "")); if (fast > 0) gModels.unshift(gModels.splice(fast, 1)[0]);   // the model that answered last time goes first
           log(`  Gemini models available (${gModels.length}): ${gModels.slice(0, 5).map(m => m.replace(/^models\//, "")).join(", ")}${gModels.length > 5 ? ", …" : ""}`); } ans = await askGemini(F, geminiKey, gModels, system, prompt, log, gUsed); await sleep(7000); }

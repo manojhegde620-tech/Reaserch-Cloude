@@ -1,0 +1,34 @@
+# T-Rex live company files: a ready-made file for every company (quarters, as T-Rex shows them), updated within minutes
+# of a new results filing, so the app opens any company at once. Checks every 5 minutes in the day (07:30–24:00 IST),
+# every 30 minutes at night. Each run lasts about 5½ hours and then starts the next one (GitHub's timer is unreliable).
+name: T-Rex live company files
+on:
+  schedule:
+    - cron: "17 */4 * * *"      # a backup start; normally each run starts the next one itself
+  workflow_dispatch:
+permissions:
+  contents: write      # to save the files in the co-data branch of this repository
+  actions: write       # to start the next run
+concurrency:
+  group: trex-live
+  cancel-in-progress: false
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Keep company files up to date
+        run: node collector/live.mjs
+        env:
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TREX_LIVE_MINUTES: "335"
+      - name: Start the next run
+        if: always()
+        run: if [ -f /tmp/trex-live-more ]; then gh workflow run live.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Not restarting."; fi
+        env:
+          GH_TOKEN: ${{ github.token }}

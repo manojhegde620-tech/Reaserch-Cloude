@@ -91,6 +91,9 @@ export async function runDeep(o = {}) {
   const loadCo = sym => { try { return JSON.parse(readFileSync(join(dir, "d", sym + ".json"), "utf8")); } catch (e) { return { symbol: sym, docs: [], facts: [] }; } };
   const publish = (msg) => {
     writeFileSync(ixPath, JSON.stringify(ix));
+    // small index for the app's peer comparison: company name, product tags, competitors named in its documents
+    const pe = {}; for (const [k, v] of Object.entries(ix.companies || {})) if (v && (v.tg || v.n)) pe[k] = [v.n || "", v.tg || [], v.cp || []];
+    writeFileSync(join(dir, "d", "peers.json"), JSON.stringify(pe));
     if (o.skipGit || !dirty) return; dirty = false;
     try { git("add", "-A"); git("commit", "--quiet", "-m", msg); git("push", "--quiet", "origin", "HEAD:" + BRANCH); log("Deep reading: saved to GitHub (" + msg + ")."); }
     catch (e) { log("Deep reading: could not save to GitHub: " + String((e.stderr && e.stderr.toString()) || e.message || e).replace(/x-access-token:[^@]+@/g, "x-access-token:***@").slice(0, 200)); }
@@ -154,7 +157,7 @@ export async function runDeep(o = {}) {
     catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; log("Deep reading: " + e.message + (st.modelList ? ` [models this key can use: ${st.modelList.slice(0, 12).join(", ") || "none listed"}]` : "") + " — stopping (the normal readers carry on with the free AIs)."); return; }
       if (e.busy) { mark(0, String(e.message || e).slice(0, 150), { transient: true }); dlog(id, String(e.message || e).slice(0, 120)); if (++busyRun >= 3) { log("Deep reading: Claude keeps saying busy / rate limit — stopping this run."); stopRun = true; } return; }
       mark(0, String(e.message || e).slice(0, 150)); return; }
-    const raw = parseFacts(ans.text); if (!raw) { mark(0, `${ans.model}: answer was not readable`); dlog(id, `${ans.model}: answer was not readable`); return; }
+    const raw = parseFacts(ans.text); if (!raw) { const t = String(ans.text || ""); mark(0, `${ans.model}: answer was not readable`); dlog(id, `${ans.model}: answer was not readable (${t.length} chars; starts "${t.slice(0, 60).replace(/\s+/g, " ")}" … ends "${t.slice(-60).replace(/\s+/g, " ")}")`); return; }
     const fv = verifyFacts(raw, pages), rawNotes = parseNotes(ans.text), nv = verifyNotes(rawNotes, [pagesRaw, pages]);
     const ex = parseExtras(ans.text, [pagesRaw, pages]);
     co.facts = co.facts.filter(x => x.doc !== d.doc).concat([...fv, ...nv].map(x => ({ symbol: sym, doc: d.doc, ...x })));
@@ -203,7 +206,7 @@ export async function runDeep(o = {}) {
     for (const d of list) { if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break; await readDoc(sym, co, d); }
     co.name = (list[0] && list[0].name) || co.name || (ann[0] && ann[0].sm_name) || sym; co.t = Date.now(); co.reader = READER_VERSION; co.v = DEEP_VERSION;
     const pending = co.docs.some(x => x.status === 0) || list.some(d => !ix.docs[d.doc]);     // a document to retry / not reached → back next run
-    ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length };
+    ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10) };
     saveCo(sym, co); cos++; sinceSave++;
     ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
     if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }

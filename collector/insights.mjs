@@ -304,12 +304,12 @@ export async function askClaude(F, key, system, prompt, log, st = {}) {
         const e = new Error(`Claude: ${r.status === 401 ? "the API key is not valid any more" : msg}`); e.fatal = true; throw e; }
       if (r.status === 400 && temp && /temperature/i.test(msg)) { temp = false; continue; }   // a model that sets its own temperature
       if (r.status === 404 || (r.status === 400 && /model/i.test(msg))) { last = `${model}: not available (${msg})`; notAvail++; break; }       // try the next model
-      if (!r.ok) { last = `${model}: HTTP ${r.status} ${msg}`; break; }
+      if (!r.ok) { last = `${model}: HTTP ${r.status} ${msg}`; log && log("    " + last); const e = new Error(last); e.busy = r.status === 408 || r.status === 409; throw e; }   // a problem with this request: try it again next run — never move to a dearer model for it
       const text = ((j && j.content) || []).filter(c => c.type === "text").map(c => c.text).join("");
       const u = (j && j.usage) || {}; st.inTok = (st.inTok || 0) + (u.input_tokens || 0); st.outTok = (st.outTok || 0) + (u.output_tokens || 0);
       const pr = claudePrice(model); st.cost = (st.cost || 0) + ((u.input_tokens || 0) * pr[0] + (u.output_tokens || 0) * pr[1]) / 1e6;
       if (text) { log && log(`    ${model} answered in ${Math.round((Date.now() - t0) / 1000)}s`); return { model, text }; }
-      last = `${model}: empty answer`; break;
+      last = `${model}: empty answer (${(j && j.stop_reason) || "?"})`; log && log("    " + last); throw new Error(last);
     }
     if (/rate limit|busy/.test(last) && last.startsWith(model)) break;     // still busy after waiting: try this document again next run (no dearer model)
   }

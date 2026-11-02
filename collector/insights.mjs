@@ -88,10 +88,23 @@ ${sel.map(p => `\n=== PAGE ${p.page} ===\n${p.text}`).join("\n")}`;
   return { system, prompt };
 }
 
+// an answer cut off at the length limit: keep every complete fact/note and close the brackets
+export function salvageJson(s) {
+  const a = s.indexOf("{"); if (a < 0) return null; const t = s.slice(a);
+  let inStr = false, esc = false; const stack = []; let lastOk = -1, lastStack = null;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true; else if (c === "{" || c === "[") stack.push(c); else if (c === "}" || c === "]") { stack.pop(); if (c === "}" && stack[stack.length - 1] === "[") { lastOk = i; lastStack = stack.slice(); } }
+  }
+  if (lastOk < 0) return null;
+  const close = lastStack.slice().reverse().map(c => c === "{" ? "}" : "]").join("");
+  try { return JSON.parse(t.slice(0, lastOk + 1) + close); } catch (e) { return null; }
+}
 function parseJson(text) {
   if (!text) return null; const s = String(text); const a = s.indexOf("{"), b = s.lastIndexOf("}");
   if (a < 0 || b <= a) { const c = s.indexOf("["), d = s.lastIndexOf("]"); if (c >= 0 && d > c) { try { return JSON.parse(s.slice(c, d + 1)); } catch (e) {} } return null; }
-  try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { return null; }
+  try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { return salvageJson(s); }
 }
 export function parseFacts(text) { const j = parseJson(text); if (!j) return null; return Array.isArray(j.facts) ? j.facts : (Array.isArray(j) ? j : null); }
 export function parseNotes(text) { const j = parseJson(text); return j && Array.isArray(j.notes) ? j.notes : []; }
@@ -216,7 +229,7 @@ export async function claudeModels(F, key, st = {}) {
   } catch (e) { if (e.fatal) throw e; }
   const ver = id => parseFloat((String(id).match(/(\d+)[-.](\d+)/) || [0, 0, 0]).slice(1).join(".")) || parseFloat((String(id).match(/-(\d+)(?:-|$)/) || [0, 0])[1]) || 0;
   const pick = re => ids.filter(id => re.test(id)).sort((a, b) => ver(b) - ver(a));
-  const found = [...pick(/haiku/i), ...pick(/sonnet/i)];
+  const hk = pick(/haiku/i); const found = hk.length ? hk : pick(/sonnet/i);
   st.models = found.length ? [...new Set([...found.slice(0, 3)])] : CLAUDE_MODELS.slice();
   st.modelList = ids;
   return st.models;
@@ -224,18 +237,19 @@ export async function claudeModels(F, key, st = {}) {
 export async function askClaude(F, key, system, prompt, log, st = {}) {
   let last = "", notAvail = 0;
   const models = await claudeModels(F, key, st);
+  let busy = 0;
   for (const model of models) {
     let temp = true;
-    for (let t = 0; t < 4; t++) {
+    for (let t = 0; t < 8; t++) {
       const t0 = Date.now(); let r, txt = "";
       try { r = await F("https://api.anthropic.com/v1/messages", { method: "POST", signal: AbortSignal.timeout(150000),
         headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model, max_tokens: 8192, ...(temp ? { temperature: 0 } : {}), system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
+        body: JSON.stringify({ model, max_tokens: 16000, ...(temp ? { temperature: 0 } : {}), system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
       catch (e) { last = `${model}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); await sleep(5000); continue; }
       let j = null; try { j = JSON.parse(txt); } catch (e) {}
       const msg = String((j && j.error && j.error.message) || txt).replace(/\s+/g, " ").slice(0, 160);
       if (r.status === 429 || r.status === 529 || r.status >= 500) {           // busy / rate limit: wait as told, then again
-        const wait = Math.min(60, +(r.headers.get("retry-after") || 0) || 10 * (t + 1)); last = `${model}: HTTP ${r.status} (busy)`; log && log(`    ${last} — waiting ${wait}s`); await sleep(wait * 1000); continue; }
+        const wait = Math.min(90, Math.max(5, +(r.headers.get("retry-after") || 0) || 10 * (t + 1))); busy++; last = `${model}: HTTP ${r.status} (${r.status === 429 ? "rate limit" : "busy"})`; log && log(`    ${last} — waiting ${wait}s`); await sleep(wait * 1000); continue; }
       if (r.status === 401 || r.status === 403 || (r.status >= 400 && /credit balance|billing|disabled|expired/i.test(msg))) {
         const e = new Error(`Claude: ${r.status === 401 ? "the API key is not valid any more" : msg}`); e.fatal = true; throw e; }
       if (r.status === 400 && temp && /temperature/i.test(msg)) { temp = false; continue; }   // a model that sets its own temperature
@@ -243,16 +257,21 @@ export async function askClaude(F, key, system, prompt, log, st = {}) {
       if (!r.ok) { last = `${model}: HTTP ${r.status} ${msg}`; break; }
       const text = ((j && j.content) || []).filter(c => c.type === "text").map(c => c.text).join("");
       const u = (j && j.usage) || {}; st.inTok = (st.inTok || 0) + (u.input_tokens || 0); st.outTok = (st.outTok || 0) + (u.output_tokens || 0);
+      const pr = claudePrice(model); st.cost = (st.cost || 0) + ((u.input_tokens || 0) * pr[0] + (u.output_tokens || 0) * pr[1]) / 1e6;
       if (text) { log && log(`    ${model} answered in ${Math.round((Date.now() - t0) / 1000)}s`); return { model, text }; }
       last = `${model}: empty answer`; break;
     }
+    if (/rate limit|busy/.test(last) && last.startsWith(model)) break;     // still busy after waiting: try this document again next run (no dearer model)
   }
   const e = new Error(last || "Claude unavailable");
-  if (notAvail && notAvail === models.length) e.config = true;   // no model can be used with this key: a set-up problem, not the document's fault
+  if (notAvail && notAvail === models.length) e.config = true;
+  if (/rate limit|busy|no answer/.test(last)) e.busy = true;   // no model can be used with this key: a set-up problem, not the document's fault
   throw e;
 }
 // approximate cost in US$ of the tokens used (Haiku 5.5 list price per million tokens: $0.10 in, $0.50 out — check the Claude pricing page)
-export const claudeCost = st => ((st.inTok || 0) * 0.10 + (st.outTok || 0) * 0.50) / 1e6;
+// US$ per million tokens (input, output) — Claude pricing page, Nov 2026; unknown models are counted at the dearest Haiku rate
+export const claudePrice = m => /haiku-5/i.test(m) ? [0.10, 0.50] : /haiku/i.test(m) ? [1, 5] : /sonnet/i.test(m) ? [2, 10] : /opus/i.test(m) ? [4, 20] : [1, 5];
+export const claudeCost = st => st.cost != null ? st.cost : ((st.inTok || 0) * 0.10 + (st.outTok || 0) * 0.50) / 1e6;
 
 // main: called from collect.mjs with its NSE session + T-Rex helpers
 export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiKey, claudeKey = process.env.ANTHROPIC_API_KEY || "", fetch: F = globalThis.fetch, pdfText = pdfTextPoppler, maxDocs = 6, extra = "", publicLog = process.env.TREX_PUBLIC_LOG === "1" }) {

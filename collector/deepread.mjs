@@ -74,17 +74,36 @@ export async function runDeep(o = {}) {
   const cookie = () => [...jar].map(([k, v]) => k + "=" + v).join("; ");
   const session = async () => { try { const r = await F(REF, { headers: { "User-Agent": UA, "Accept": "text/html" }, signal: AbortSignal.timeout(20000) }); keep(r); await r.arrayBuffer(); } catch (e) {} };
   const nseJson = async url => { try { const r = await F(url, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": REF, ...(jar.size ? { Cookie: cookie() } : {}) }, signal: AbortSignal.timeout(40000) }); keep(r); if (r.status !== 200) return { code: r.status }; return { code: 200, j: JSON.parse(await r.text()) }; } catch (e) { return { code: 0 }; } };
+  // PDFs: curl first (like the main collector, with the same headers), then Node's own https on a fresh connection
+  const curlGet = url => new Promise(res => {
+    const tmp = join(tmpdir(), "trexd-" + Date.now() + "-" + Math.random().toString(36).slice(2) + ".pdf");
+    execFile("curl", ["-sSL", "--max-time", "90", "-A", UA, "-e", REF, "-H", "Accept: application/pdf,*/*", "-o", tmp, "-w", "%{http_code}", ...(jar.size ? ["-H", "Cookie: " + cookie()] : []), url], { timeout: 100000 }, (e, out, err) => {
+      let body = null; try { body = readFileSync(tmp); unlinkSync(tmp); } catch (x) {}
+      res({ code: e ? 0 : +String(out).trim() || 0, body, why: e ? String(err || e.message || "curl failed").trim().slice(0, 80) : "" });
+    });
+  });
+  const httpsGet = async (url, ms = 120000, hops = 0) => { const https = await import("node:https"); return new Promise(res => {
+    let done = false; const fin = v => { if (!done) { done = true; clearTimeout(tm); res(v); } };
+    const req = https.get(url, { agent: false, headers: { "User-Agent": UA, "Accept": "application/pdf,*/*", "Accept-Encoding": "identity", "Referer": REF, "Connection": "close", ...(jar.size ? { Cookie: cookie() } : {}) } }, r => {
+      if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && hops < 3) { r.resume(); done = true; clearTimeout(tm); res(httpsGet(new URL(r.headers.location, url).href, ms, hops + 1)); return; }
+      const parts = []; r.on("data", c => parts.push(c)); r.on("end", () => fin({ code: r.statusCode, body: Buffer.concat(parts) })); r.on("error", e => fin({ code: 0, body: null, why: e.code || e.message }));
+    });
+    const tm = setTimeout(() => { req.destroy(); fin({ code: 0, body: null, why: "timed out" }); }, ms);
+    req.on("error", e => fin({ code: 0, body: null, why: e.code || e.message }));
+  }); };
+  const good = r => r.code === 200 && r.body && r.body.length >= 1000;
   const pdfGet = o.pdfGet || (async url => {
-    const tmp = join(tmpdir(), "trexd-" + Date.now() + ".pdf");
-    const code = await new Promise(r => execFile("curl", ["-sSL", "--max-time", "150", "-A", UA, "-e", REF, "-o", tmp, "-w", "%{http_code}", ...(jar.size ? ["-H", "Cookie: " + cookie()] : []), url], { timeout: 160000 }, (e, out) => r(e ? 0 : +String(out).trim() || 0)));
-    let body = null; try { body = readFileSync(tmp); unlinkSync(tmp); } catch (e) {} return { code, body };
+    let r = await curlGet(url); if (good(r)) return r;
+    const first = r.why || "HTTP " + r.code; await session();
+    r = await httpsGet(url); if (!good(r)) r.why = `${first}; then ${r.why || "HTTP " + r.code}`; return r;
   });
   const pdfText = o.pdfText || pdfTextPoppler;
   await session();
-  const st = { inTok: 0, outTok: 0 }, spent0 = ix.spent || 0; let docs = 0, facts = 0, cos = 0, blocked = 0, sinceSave = 0;
+  const st = { inTok: 0, outTok: 0 }, spent0 = ix.spent || 0; let docs = 0, facts = 0, cos = 0, blocked = 0, sinceSave = 0, busyRun = 0, stopRun = false;
   const to = new Date(), from = new Date(Date.now() - 400 * 864e5);
+  let dn = 0; const dlog = m => log(`  doc ${dn}: ${m}`);                 // (public log: no company names)
   for (const sym of tg.symbols) {
-    if (Date.now() > until - 120000 || docs >= maxDocs) break;
+    if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break;
     const c = ix.companies[sym]; if (c && c.t && Date.now() - c.t < 120 * 864e5) continue;          // read in the last 4 months
     const a = await nseJson(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from)}&to_date=${dmy(to)}`);
     const ar = await nseJson(`https://www.nseindia.com/api/annual-reports?index=equities&symbol=${encodeURIComponent(sym)}`);
@@ -95,10 +114,11 @@ export async function runDeep(o = {}) {
     const co = loadCo(sym);
     for (const d of list) {
       if (Date.now() > until - 120000 || docs >= maxDocs) break;
-      const mark = (s, note, extra = {}) => { const tries = ((ix.docs[d.doc] || {}).n || 0) + (s === 0 ? 1 : 0); ix.docs[d.doc] = { s: s === 0 && tries >= 3 ? 2 : s, n: tries };
+      dn++;
+      const mark = (s, note, extra = {}) => { const tries = ((ix.docs[d.doc] || {}).n || 0) + (s === 0 && !extra.transient ? 1 : 0); ix.docs[d.doc] = { s: s === 0 && tries >= 3 ? 2 : s, n: tries };
         co.docs = co.docs.filter(x => x.doc !== d.doc); co.docs.push({ doc: d.doc, symbol: sym, type: d.type, date: d.date, status: ix.docs[d.doc].s, model: extra.model || "", n: extra.n || 0, note, t: Date.now(), source: "deep" }); };
-      const r = await pdfGet(d.doc);
-      if (r.code !== 200 || !r.body || r.body.length < 1000) { mark(0, `could not download (HTTP ${r.code})`); continue; }
+      const tD = Date.now(); const r = await pdfGet(d.doc); const dlS = Math.round((Date.now() - tD) / 1000);
+      if (r.code !== 200 || !r.body || r.body.length < 1000) { mark(0, `could not download (${r.why || "HTTP " + r.code})`); dlog(`could not download after ${dlS}s (${r.why || "HTTP " + r.code})`); continue; }
       if (r.body.length > 40 * 1024 * 1024) { mark(2, "file too large"); continue; }
       let pages = []; try { pages = await pdfText(r.body); } catch (e) { mark(0, "PDF damaged or incomplete"); continue; }
       if (pages.join("").replace(/\s/g, "").length < 120) { mark(2, "no text in PDF (scanned images)"); continue; }
@@ -107,14 +127,17 @@ export async function runDeep(o = {}) {
       const sel = selectPages(pages, Math.round(budgetFor(d.type) * 1.5)); if (!sel.length) { mark(1, "no business pages found"); continue; }
       const { system, prompt } = buildPrompt(d.name, sym, d.type, d.date, sel);
       let ans;
-      try { ans = await askClaude(F, ckey, system, prompt, null, st); }
+      const tA = Date.now();
+      try { ans = await askClaude(F, ckey, system, prompt, m => dlog(m.trim()), st); }
       catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); log("Deep reading: " + e.message + (st.modelList ? ` [models this key can use: ${st.modelList.slice(0, 12).join(", ") || "none listed"}]` : "") + " — stopping (the normal readers carry on with the free AIs)."); publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
+        if (e.busy) { mark(0, String(e.message || e).slice(0, 150), { transient: true }); dlog(String(e.message || e).slice(0, 120)); if (++busyRun >= 3) { log("Deep reading: Claude keeps saying busy / rate limit — stopping this run."); stopRun = true; break; } continue; }
         mark(0, String(e.message || e).slice(0, 150)); continue; }
-      const raw = parseFacts(ans.text); if (!raw) { mark(0, `${ans.model}: answer was not readable`); continue; }
+      const raw = parseFacts(ans.text); if (!raw) { mark(0, `${ans.model}: answer was not readable`); dlog(`${ans.model}: answer was not readable`); continue; }
       const fv = verifyFacts(raw, pages), rawNotes = parseNotes(ans.text), nv = verifyNotes(rawNotes, [pagesRaw, pages]);
       co.facts = co.facts.filter(x => x.doc !== d.doc).concat([...fv, ...nv].map(x => ({ symbol: sym, doc: d.doc, ...x })));
       mark(1, `${raw.length} numbers found by AI, ${fv.length} confirmed on the page; ${nv.length} of ${rawNotes.length} quotes confirmed`, { model: ans.model, n: fv.length + nv.length });
-      docs++; facts += fv.length + nv.length;
+      docs++; facts += fv.length + nv.length; busyRun = 0;
+      dlog(`download ${dlS}s, AI ${Math.round((Date.now() - tA) / 1000)}s — ${fv.length + nv.length} checked facts [${ans.model}]`);
     }
     co.name = (list[0] && list[0].name) || co.name || sym; co.t = Date.now(); co.reader = READER_VERSION;
     const pending = co.docs.some(x => x.status === 0);       // a document to retry → the company comes back next run

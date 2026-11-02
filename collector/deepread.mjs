@@ -133,7 +133,7 @@ export async function runDeep(o = {}) {
   });
   const pdfText = o.pdfText || pdfTextPoppler;
   await session();
-  const st = { inTok: 0, outTok: 0 }, spent0 = ix.spent || 0; let docs = 0, facts = 0, cos = 0, blocked = 0, sinceSave = 0, busyRun = 0, stopRun = false;
+  const st = { inTok: 0, outTok: 0 }, spent0 = ix.spent || 0; let docs = 0, facts = 0, cos = 0, blocked = 0, sinceSave = 0, busyRun = 0, stopRun = false, lastPub = Date.now();
   const to = new Date(), from = new Date(Date.now() - 400 * 864e5), from2 = new Date(Date.now() - 800 * 864e5);
   let dn = 0; const dlog = (id, m) => log(`  doc ${id}: ${m}`);                 // (public log: no company names)
   let gateT = 0; const gate = async () => { const w = Math.max(0, gateT - Date.now()); gateT = Math.max(Date.now(), gateT) + (o.nseGap ?? 450); if (w) await sleep(w); };   // NSE: one request at a time, spaced
@@ -224,7 +224,7 @@ export async function runDeep(o = {}) {
     saveCo(sym, co); cos++; sinceSave++;
     ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
     if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
-    if (sinceSave >= 20) { sinceSave = 0; publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }
+    if (sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }   // saved at least every 8 minutes
   }
   // several companies at once (each still reads its documents one by one); NSE requests stay spaced out
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);

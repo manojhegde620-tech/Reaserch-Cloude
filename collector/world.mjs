@@ -82,7 +82,8 @@ export function buildSea(rows, now = Date.now()) {
   const by = {}; for (const a of rows) (by[a.portid] = by[a.portid] || []).push(a);
   const routes = [];
   for (const def of SEA) {
-    const rs = (by[def.id] || []).map(a => ({ d: iso(a.date), t: +a.date, n: a.n_total, k: a.n_tanker, c: a.n_container })).sort((x, y) => x.t - y.t);
+    const rs = (by[def.id] || []).map(a => { const t = typeof a.date === "number" ? a.date : Date.parse(String(a.date).slice(0, 10) + "T00:00:00Z"); return { d: iso(t), t, n: a.n_total, k: a.n_tanker, c: a.n_container }; })   // the service sends dates as "YYYY-MM-DD" (date-only field)
+      .filter(x => isFinite(x.t) && x.n != null).sort((x, y) => x.t - y.t);
     const cur = rs.filter(x => x.t > now - 200 * DAY);
     if (!cur.length) { routes.push({ ...def, status: "na", note: "no data" }); continue; }
     const last = cur[cur.length - 1].t;

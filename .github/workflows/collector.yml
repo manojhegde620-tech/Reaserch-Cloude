@@ -22,12 +22,18 @@ jobs:
           node-version: 22
       - name: Install PDF text tool (for reading company presentations)
         run: sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+      - name: World watch (trade routes, disasters, air traffic, news — public data, no AI)
+        run: node collector/world.mjs
+        timeout-minutes: 6
+        env:
+          TREX_KEY: ${{ secrets.TREX_KEY }}
       - name: Collect NSE filings for T-Rex
+        if: always()
         run: node collector/collect.mjs
         env:
           TREX_KEY: ${{ secrets.TREX_KEY }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
-          TREX_MAX_MINUTES: "25"
+          TREX_MAX_MINUTES: "23"
           TREX_MONTH_MINUTES: "100000"   # public repository: GitHub minutes are free and unlimited
           TREX_PUBLIC_LOG: "1"           # logs are public: hide watchlist company names
       - name: Publish the market-data copy (GitHub mirror, gh-pages branch)

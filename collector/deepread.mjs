@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, parseExtras, pdfTextPoppler, askClaude, claudeCost, READER_VERSION } from "./insights.mjs";
 import { shpPledge, xbrlNum } from "./companyinfo.mjs";
+import { evaluatePromises, dueOf } from "./promises.mjs";
 export const DEEP_VERSION = 2;                 // v2: + management commitments, analyst concerns, competitors, product tags, red flags, holding, insider trades
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
@@ -177,7 +178,7 @@ export async function runDeep(o = {}) {
       const dtp = x => { const d = Date.parse(String(x || "").replace(/-/g, " ")); return isNaN(d) ? 0 : d; };
       const list = list0.filter(r => r && r.date && num(r.pr_and_prgrp) != null).sort((a, b) => dtp(b.date) - dtp(a.date)); const seen = new Set();
       if (list.length) co.holding = list.filter(r => !seen.has(r.date) && seen.add(r.date)).slice(0, 8).map(r => ({ d: r.date, p: num(r.pr_and_prgrp), pub: num(r.public_val) }));
-      if (list[0] && list[0].xbrl && !o.skipShp) { await gate(); const x = await pdfGet(list[0].xbrl); if (x.code === 200 && x.body) { const xml = x.body.toString("utf8"); co.pledge = { ...shpPledge(xml), d: list[0].date }; } }
+      if (list[0] && list[0].xbrl && !o.skipShp) { await gate(); const x = await pdfGet(list[0].xbrl); if (x.code === 200 && x.body) { const xml = x.body.toString("utf8"); co.pledge = { ...shpPledge(xml), totalShares: xbrlNum(xml, "NumberOfShares"), d: list[0].date }; } }
     } catch (e) {}
     try {
       const pit = await nseG(`https://www.nseindia.com/api/corporates-pit?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from)}&to_date=${dmy(to)}`);
@@ -205,6 +206,19 @@ export async function runDeep(o = {}) {
     await companyExtras(sym, co);
     for (const d of list) { if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break; await readDoc(sym, co, d); }
     co.name = (list[0] && list[0].name) || co.name || (ann[0] && ann[0].sm_name) || sym; co.t = Date.now(); co.reader = READER_VERSION; co.v = DEEP_VERSION;
+    // promises vs delivery: judge the commitments whose date has passed, from later documents + the filings
+    if (!stopRun && (co.commitments || []).some(c => { const d = dueOf(c.by); return d ? d < Date.now() - 20 * 864e5 : false; }) && !o.skipPromises) {
+      try {
+        let quarters = [];
+        const j = await F(`${server}/api/db?symbol=${encodeURIComponent(sym)}`, { signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null);
+        if (j && j.ok) { const qs = j.quarters || []; const basis = qs.some(q => q.basis === "C") ? "C" : "S"; const mine = qs.filter(q => q.basis === basis);
+          const by = Object.fromEntries(mine.map(q => [q.qe, q])); const ly = qe => { const [y, m] = qe.split("-"); return `${+y - 1}-${m}-${qe.slice(8)}`; };
+          const g = (a, b) => a != null && b ? Math.round((a - b) / Math.abs(b) * 1000) / 10 : null;
+          quarters = mine.map(q => { const p = by[ly(q.qe)] || mine.find(x => x.qe.slice(0, 7) === ly(q.qe).slice(0, 7)); return { qe: q.qe, basis, sales: q.sales, opm: q.opm, np: q.np, pdf: q.pdf || null, xbrl: q.xbrl || null, yoySales: p ? g(q.sales, p.sales) : null, yoyNp: p ? g(q.np, p.np) : null }; }); }
+        const nj = await evaluatePromises(sym, co, { quarters, ask: (sys, pr) => askClaude(F, ckey, sys, pr, null, st) });
+        if (nj) co.judged = (co.judged || 0) + nj;
+      } catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; } }
+    }
     const pending = co.docs.some(x => x.status === 0) || list.some(d => !ix.docs[d.doc]);     // a document to retry / not reached → back next run
     ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10) };
     saveCo(sym, co); cos++; sinceSave++;

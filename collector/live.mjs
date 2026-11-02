@@ -131,8 +131,13 @@ export async function runLive(o = {}) {
     const list = await everyone(); const bUntil = Math.min(now() + backfillMs, until - 60e3);
     if (list.length) {
       if (st.cursor >= list.length && now() - (st.full || 0) > 7 * 864e5) st.cursor = 0;
-      const one = async () => { while (st.cursor < list.length && now() < bUntil) { const sym = list[st.cursor++]; stDirty = 1; const f = load(sym); if (f && now() - (f.t || 0) < 6 * 864e5) continue; if (await build(sym, null)) filled++; if (o.gap) await sleep(o.gap); } };
+      st.miss = st.miss || {};
+      const one = async () => { while (st.cursor < list.length && now() < bUntil) { const sym = list[st.cursor++]; stDirty = 1; const f = load(sym); if (f && now() - (f.t || 0) < 6 * 864e5) continue;
+        if (await build(sym, null)) { filled++; delete st.miss[sym]; } else st.miss[sym] = now(); if (o.gap) await sleep(o.gap); } };
       await Promise.all([one(), one(), one()]);
+      // companies whose database copy was not complete yet: tried again every 30 minutes (database only — never NSE)
+      const again = Object.entries(st.miss).filter(([, t]) => now() - t > 30 * 60e3).slice(0, 40);
+      for (const [sym] of again) { if (now() > until - 60e3) break; if (await build(sym, null)) { filled++; delete st.miss[sym]; } else st.miss[sym] = now(); stDirty = 1; }
       if (st.cursor >= list.length && now() - (st.full || 0) > 7 * 864e5) st.full = now();
     }
     publish(`company files: ${done} new results, ${filled} filled`);

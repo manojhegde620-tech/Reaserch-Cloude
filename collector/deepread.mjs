@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, parseExtras, pdfTextPoppler, askClaude, claudeCost, READER_VERSION } from "./insights.mjs";
 import { shpPledge, xbrlNum } from "./companyinfo.mjs";
-import { evaluatePromises, dueOf } from "./promises.mjs";
+import { evaluatePromises, dueOf, JUDGE_RULES } from "./promises.mjs";
 export const DEEP_VERSION = 2;                 // v2: + management commitments, analyst concerns, competitors, product tags, red flags, holding, insider trades
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
@@ -193,7 +193,7 @@ export async function runDeep(o = {}) {
     co.hx = Date.now();
   }
   // promises vs delivery: judge the commitments whose date has passed, from later documents + the filings
-  const ripeCount = co => (co.commitments || []).filter(c => { const d = dueOf(c.by); return d && d < Date.now() - 20 * 864e5 && (!c.verdict || (c.verdict.s === "unclear" && Date.now() - (c.verdict.t || 0) > 90 * 864e5)); }).length;
+  const ripeCount = co => (co.commitments || []).filter(c => { const d = dueOf(c.by); return d && d < Date.now() - 20 * 864e5 && (!c.verdict || (c.verdict.s !== "unclear" && (c.verdict.r || 0) < JUDGE_RULES) || (c.verdict.s === "unclear" && Date.now() - (c.verdict.t || 0) > 90 * 864e5)); }).length;
   async function judgeCo(sym, co) {
     if (!stopRun && ripeCount(co) && !o.skipPromises) {
       try {
@@ -233,9 +233,9 @@ export async function runDeep(o = {}) {
   }
   // first: commitments of companies read earlier whose deadline has now passed (weekly check, a few minutes per run)
   { const jUntil = Math.min(until - 120000, Date.now() + (o.judgeMinutes ?? 8) * 60e3); let jn = 0;
-    const due = Object.entries(ix.companies).filter(([, c]) => c && c.v >= DEEP_VERSION && c.t && (c.ripe == null || c.ripe > 0) && Date.now() - (c.jt || 0) > 7 * 864e5).map(([s]) => s);
+    const due = Object.entries(ix.companies).filter(([, c]) => c && c.v >= DEEP_VERSION && c.t && (c.ripe == null || c.ripe > 0 || (c.jr || 0) < JUDGE_RULES) && (Date.now() - (c.jt || 0) > 7 * 864e5 || (c.jr || 0) < JUDGE_RULES)).map(([s]) => s);
     for (const sym of due) { if (stopRun || Date.now() > jUntil) break; const co = loadCo(sym); const before = co.judged || 0; await judgeCo(sym, co);
-      Object.assign(ix.companies[sym], { ripe: ripeCount(co), jt: co.jt || Date.now() }); saveCo(sym, co); jn += (co.judged || 0) - before; }
+      Object.assign(ix.companies[sym], { ripe: ripeCount(co), jt: co.jt || Date.now(), jr: JUDGE_RULES }); saveCo(sym, co); jn += (co.judged || 0) - before; }
     if (due.length) log(`Deep reading: promises checked for ${Math.min(due.length, jn ? due.length : due.length)} compan${due.length === 1 ? "y" : "ies"} — ${jn} verdicts.`); }
   // several companies at once (each still reads its documents one by one); NSE requests stay spaced out
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);

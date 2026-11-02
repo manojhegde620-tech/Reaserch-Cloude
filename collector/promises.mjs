@@ -21,6 +21,7 @@ export function dueOf(by) {                      // end of the period a commitme
   if (yr) return E(+yr[1], 12);
   return null;
 }
+export const JUDGE_RULES = 2;              // v2: a "missed" must rest on evidence from after the deadline
 export const promiseId = c => [c.doc, c.page, String(c.quote || "").slice(0, 60)].join("|");
 // evidence the AI may use: later facts/quotes from the company + quarterly results from the filings
 export function evidenceFor(c, co, quarters) {
@@ -56,16 +57,22 @@ ${ev.map(e => `${e.id}: ${e.text} [${e.src}]`).join("\n")}
 Decide, strictly from the evidence above:
 - "delivered": the evidence shows the target was met (or clearly exceeded) by the deadline;
 - "partly": clearly part of it was achieved, or achieved late;
-- "missed": the evidence shows it was not achieved by the deadline (including the same promise pushed to a later date);
+- "missed": evidence dated AFTER the deadline shows it was not achieved, or the company itself moved the deadline later
+  (evidence from before the deadline cannot show a miss);
 - "unclear": the evidence does not say enough. Prefer "unclear" over guessing. Never use outside knowledge.
 Reply as {"verdict":"delivered|partly|missed|unclear","why":"one short sentence citing the numbers","evidence":["E1","F2"]}`;
   return { system, prompt };
 }
-export function parseVerdict(text, ev) {
+export function parseVerdict(text, ev, due = null) {
   let j = null; try { const s = String(text || ""); j = JSON.parse(s.slice(s.indexOf("{"), s.lastIndexOf("}") + 1)); } catch (e) { return null; }
   const s = String(j.verdict || "").toLowerCase(); if (!["delivered", "partly", "missed", "unclear"].includes(s)) return null;
   const ids = new Set((Array.isArray(j.evidence) ? j.evidence : []).map(String)); const used = ev.filter(e => ids.has(e.id));
   if (s !== "unclear" && !used.length) return { s: "unclear", why: "No evidence was named for a verdict.", ev: [] };   // a verdict without evidence is not accepted
+  // a "missed" needs proof from after the deadline (a later document, a results filing for a period after it, or a moved deadline)
+  if (s === "missed" && due) {
+    const after = used.some(e => e.filing ? when(e.qe) >= due - 864e5 : when(e.date) > due || /later commitment/.test(e.text || ""));
+    if (!after) return { s: "unclear", why: "Nothing from after the deadline yet — will be checked again.", ev: [] };
+  }
   return { s, why: String(j.why || "").slice(0, 300), ev: used.slice(0, 4).map(e => ({ doc: e.doc, page: e.page || null, quote: e.filing ? e.text : e.quote, date: e.date || e.qe || "", filing: !!e.filing })) };
 }
 // evaluate the due commitments of one company (in place); returns how many were judged
@@ -75,14 +82,14 @@ export async function evaluatePromises(sym, co, { ask, quarters, now = Date.now(
     const due = dueOf(c.by); const said = when(c.date);
     const ripe = due ? due < now - 20 * 864e5 : said && said < now - 400 * 864e5;           // its date has passed (results take ~3 weeks to file)
     if (!ripe) continue;
-    if (c.verdict && c.verdict.s !== "unclear") continue;
+    if (c.verdict && c.verdict.s !== "unclear" && (c.verdict.r || 0) >= JUDGE_RULES) continue;
     if (c.verdict && c.verdict.s === "unclear" && now - (c.verdict.t || 0) < 90 * 864e5) continue;     // look again after 3 months
     const ev = evidenceFor(c, co, quarters);
     if (!ev.length) { c.verdict = { s: "unclear", why: "No later document or result covers this yet.", ev: [], t: now }; continue; }
     const { system, prompt } = judgePrompt(co.name || sym, c, ev);
     let ans; try { ans = await ask(system, prompt); } catch (e) { if (e.fatal || e.config) throw e; continue; }
-    const v = parseVerdict(ans && ans.text, ev); if (!v) continue;
-    c.verdict = { ...v, t: now, model: ans.model }; n++;
+    const v = parseVerdict(ans && ans.text, ev, due); if (!v) continue;
+    c.verdict = { ...v, t: now, model: ans.model, r: JUDGE_RULES }; n++;
   }
   return n;
 }

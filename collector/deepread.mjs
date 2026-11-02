@@ -192,6 +192,23 @@ export async function runDeep(o = {}) {
     } catch (e) {}
     co.hx = Date.now();
   }
+  // promises vs delivery: judge the commitments whose date has passed, from later documents + the filings
+  const ripeCount = co => (co.commitments || []).filter(c => { const d = dueOf(c.by); return d && d < Date.now() - 20 * 864e5 && (!c.verdict || (c.verdict.s === "unclear" && Date.now() - (c.verdict.t || 0) > 90 * 864e5)); }).length;
+  async function judgeCo(sym, co) {
+    if (!stopRun && ripeCount(co) && !o.skipPromises) {
+      try {
+        let quarters = [];
+        const j = await F(`${server}/api/db?symbol=${encodeURIComponent(sym)}`, { signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null);
+        if (j && j.ok) { const qs = j.quarters || []; const basis = qs.some(q => q.basis === "C") ? "C" : "S"; const mine = qs.filter(q => q.basis === basis);
+          const by = Object.fromEntries(mine.map(q => [q.qe, q])); const ly = qe => { const [y, m] = qe.split("-"); return `${+y - 1}-${m}-${qe.slice(8)}`; };
+          const g = (a, b) => a != null && b ? Math.round((a - b) / Math.abs(b) * 1000) / 10 : null;
+          quarters = mine.map(q => { const p = by[ly(q.qe)] || mine.find(x => x.qe.slice(0, 7) === ly(q.qe).slice(0, 7)); return { qe: q.qe, basis, sales: q.sales, opm: q.opm, np: q.np, pdf: q.pdf || null, xbrl: q.xbrl || null, yoySales: p ? g(q.sales, p.sales) : null, yoyNp: p ? g(q.np, p.np) : null }; }); }
+        const nj = await evaluatePromises(sym, co, { quarters, ask: (sys, pr) => askClaude(F, ckey, sys, pr, null, st) });
+        if (nj) co.judged = (co.judged || 0) + nj;
+      } catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; } }
+    }
+    co.jt = Date.now();
+  }
   async function processCo(sym) {
     const c = ix.companies[sym]; if (c && c.t && c.v >= DEEP_VERSION && Date.now() - c.t < 120 * 864e5) return;          // read in the last 4 months
     const nTr = (order.get(sym) ?? 9999) < deepN ? deepTr : 2;
@@ -206,26 +223,20 @@ export async function runDeep(o = {}) {
     await companyExtras(sym, co);
     for (const d of list) { if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break; await readDoc(sym, co, d); }
     co.name = (list[0] && list[0].name) || co.name || (ann[0] && ann[0].sm_name) || sym; co.t = Date.now(); co.reader = READER_VERSION; co.v = DEEP_VERSION;
-    // promises vs delivery: judge the commitments whose date has passed, from later documents + the filings
-    if (!stopRun && (co.commitments || []).some(c => { const d = dueOf(c.by); return d ? d < Date.now() - 20 * 864e5 : false; }) && !o.skipPromises) {
-      try {
-        let quarters = [];
-        const j = await F(`${server}/api/db?symbol=${encodeURIComponent(sym)}`, { signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null);
-        if (j && j.ok) { const qs = j.quarters || []; const basis = qs.some(q => q.basis === "C") ? "C" : "S"; const mine = qs.filter(q => q.basis === basis);
-          const by = Object.fromEntries(mine.map(q => [q.qe, q])); const ly = qe => { const [y, m] = qe.split("-"); return `${+y - 1}-${m}-${qe.slice(8)}`; };
-          const g = (a, b) => a != null && b ? Math.round((a - b) / Math.abs(b) * 1000) / 10 : null;
-          quarters = mine.map(q => { const p = by[ly(q.qe)] || mine.find(x => x.qe.slice(0, 7) === ly(q.qe).slice(0, 7)); return { qe: q.qe, basis, sales: q.sales, opm: q.opm, np: q.np, pdf: q.pdf || null, xbrl: q.xbrl || null, yoySales: p ? g(q.sales, p.sales) : null, yoyNp: p ? g(q.np, p.np) : null }; }); }
-        const nj = await evaluatePromises(sym, co, { quarters, ask: (sys, pr) => askClaude(F, ckey, sys, pr, null, st) });
-        if (nj) co.judged = (co.judged || 0) + nj;
-      } catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; } }
-    }
+    await judgeCo(sym, co);
     const pending = co.docs.some(x => x.status === 0) || list.some(d => !ix.docs[d.doc]);     // a document to retry / not reached → back next run
-    ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10) };
+    ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10), ripe: ripeCount(co), jt: co.jt || 0 };
     saveCo(sym, co); cos++; sinceSave++;
     ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
     if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
     if (sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }   // saved at least every 8 minutes
   }
+  // first: commitments of companies read earlier whose deadline has now passed (weekly check, a few minutes per run)
+  { const jUntil = Math.min(until - 120000, Date.now() + (o.judgeMinutes ?? 8) * 60e3); let jn = 0;
+    const due = Object.entries(ix.companies).filter(([, c]) => c && c.v >= DEEP_VERSION && c.t && (c.ripe == null || c.ripe > 0) && Date.now() - (c.jt || 0) > 7 * 864e5).map(([s]) => s);
+    for (const sym of due) { if (stopRun || Date.now() > jUntil) break; const co = loadCo(sym); const before = co.judged || 0; await judgeCo(sym, co);
+      Object.assign(ix.companies[sym], { ripe: ripeCount(co), jt: co.jt || Date.now() }); saveCo(sym, co); jn += (co.judged || 0) - before; }
+    if (due.length) log(`Deep reading: promises checked for ${Math.min(due.length, jn ? due.length : due.length)} compan${due.length === 1 ? "y" : "ies"} — ${jn} verdicts.`); }
   // several companies at once (each still reads its documents one by one); NSE requests stay spaced out
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);
   const worker = async () => { while (!stopRun && Date.now() < until - 120000 && docs < maxDocs) { const sym = tg.symbols[next++]; if (sym === undefined) break; try { await processCo(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };

@@ -205,22 +205,41 @@ async function askGemini(F, key, models, system, prompt, log, used = new Map()) 
 // Claude (your own Anthropic API key, paid from the plan's monthly API credit): fast and steady. Cheapest suitable model first.
 // Throws with .fatal when the key is missing / expired / out of credit (then the other AIs take over for good).
 export const CLAUDE_MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5"];
+// which Claude models this key may use (asked once): the cheapest suitable (Haiku) first, then Sonnet
+export async function claudeModels(F, key, st = {}) {
+  if (st.models) return st.models;
+  let ids = [];
+  try {
+    const r = await F("https://api.anthropic.com/v1/models?limit=100", { headers: { "x-api-key": key, "anthropic-version": "2023-06-01" }, signal: AbortSignal.timeout(30000) });
+    if (r.status === 401 || r.status === 403) { const e = new Error("Claude: the API key is not valid (HTTP " + r.status + ")"); e.fatal = true; throw e; }
+    if (r.ok) { const j = await r.json(); ids = (j.data || []).map(m => m.id).filter(Boolean); }
+  } catch (e) { if (e.fatal) throw e; }
+  const ver = id => parseFloat((String(id).match(/(\d+)[-.](\d+)/) || [0, 0, 0]).slice(1).join(".")) || parseFloat((String(id).match(/-(\d+)(?:-|$)/) || [0, 0])[1]) || 0;
+  const pick = re => ids.filter(id => re.test(id)).sort((a, b) => ver(b) - ver(a));
+  const found = [...pick(/haiku/i), ...pick(/sonnet/i)];
+  st.models = found.length ? [...new Set([...found.slice(0, 3)])] : CLAUDE_MODELS.slice();
+  st.modelList = ids;
+  return st.models;
+}
 export async function askClaude(F, key, system, prompt, log, st = {}) {
-  let last = "";
-  for (const model of (st.models || CLAUDE_MODELS)) {
+  let last = "", notAvail = 0;
+  const models = await claudeModels(F, key, st);
+  for (const model of models) {
+    let temp = true;
     for (let t = 0; t < 4; t++) {
       const t0 = Date.now(); let r, txt = "";
       try { r = await F("https://api.anthropic.com/v1/messages", { method: "POST", signal: AbortSignal.timeout(150000),
         headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model, max_tokens: 8192, temperature: 0, system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
+        body: JSON.stringify({ model, max_tokens: 8192, ...(temp ? { temperature: 0 } : {}), system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
       catch (e) { last = `${model}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); await sleep(5000); continue; }
       let j = null; try { j = JSON.parse(txt); } catch (e) {}
-      const msg = String((j && j.error && j.error.message) || txt).replace(/\s+/g, " ").slice(0, 140);
+      const msg = String((j && j.error && j.error.message) || txt).replace(/\s+/g, " ").slice(0, 160);
       if (r.status === 429 || r.status === 529 || r.status >= 500) {           // busy / rate limit: wait as told, then again
         const wait = Math.min(60, +(r.headers.get("retry-after") || 0) || 10 * (t + 1)); last = `${model}: HTTP ${r.status} (busy)`; log && log(`    ${last} — waiting ${wait}s`); await sleep(wait * 1000); continue; }
       if (r.status === 401 || r.status === 403 || (r.status >= 400 && /credit balance|billing|disabled|expired/i.test(msg))) {
         const e = new Error(`Claude: ${r.status === 401 ? "the API key is not valid any more" : msg}`); e.fatal = true; throw e; }
-      if (r.status === 404 || (r.status === 400 && /model/i.test(msg))) { last = `${model}: not available`; break; }       // try the next model
+      if (r.status === 400 && temp && /temperature/i.test(msg)) { temp = false; continue; }   // a model that sets its own temperature
+      if (r.status === 404 || (r.status === 400 && /model/i.test(msg))) { last = `${model}: not available (${msg})`; notAvail++; break; }       // try the next model
       if (!r.ok) { last = `${model}: HTTP ${r.status} ${msg}`; break; }
       const text = ((j && j.content) || []).filter(c => c.type === "text").map(c => c.text).join("");
       const u = (j && j.usage) || {}; st.inTok = (st.inTok || 0) + (u.input_tokens || 0); st.outTok = (st.outTok || 0) + (u.output_tokens || 0);
@@ -228,7 +247,9 @@ export async function askClaude(F, key, system, prompt, log, st = {}) {
       last = `${model}: empty answer`; break;
     }
   }
-  throw new Error(last || "Claude unavailable");
+  const e = new Error(last || "Claude unavailable");
+  if (notAvail && notAvail === models.length) e.config = true;   // no model can be used with this key: a set-up problem, not the document's fault
+  throw e;
 }
 // approximate cost in US$ of the tokens used (Haiku 5.5 list price per million tokens: $0.10 in, $0.50 out — check the Claude pricing page)
 export const claudeCost = st => ((st.inTok || 0) * 0.10 + (st.outTok || 0) * 0.50) / 1e6;
@@ -289,7 +310,7 @@ export async function runInsights({ trex, nse, pdfGet, log: log0, until, geminiK
     let ans = null, why = "";
     if (claudeKey && !claudeOff) {                               // your Claude API key first (when set), then the free AIs
       try { ans = await askClaude(F, claudeKey, system, prompt, log, cSt); }
-      catch (e) { why = String(e.message || e); if (e.fatal) { claudeOff = true; log(`  ${why} — using Gemini / Cloudflare AI from now on.`); } }
+      catch (e) { why = String(e.message || e); if (e.fatal || e.config) { claudeOff = true; log(`  ${why} — using Gemini / Cloudflare AI from now on.`); } }
     }
     if (!ans && !geminiOff) {
       try { if (!gModels) { gModels = await pickGeminiModel(F, geminiKey);

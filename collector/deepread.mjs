@@ -53,6 +53,7 @@ export async function runDeep(o = {}) {
   mkdirSync(join(dir, "d"), { recursive: true });
   const ixPath = join(dir, "d", "index.json");
   let ix = { v: 1, companies: {}, docs: {}, spent: 0, inTok: 0, outTok: 0 }; try { if (existsSync(ixPath)) ix = { ...ix, ...JSON.parse(readFileSync(ixPath, "utf8")) }; } catch (e) {}
+  if (!(ix.v >= 2)) { for (const [k, v] of Object.entries(ix.docs || {})) if (v.s === 0) delete ix.docs[k]; ix.v = 2; }
   if (ix.spent >= cap) { log(`Deep reading: the budget of $${cap} is used ($${ix.spent.toFixed(2)}) — stopping.`); return { ok: true, done: true }; }
   if (ix.keyDead && Date.now() - ix.keyDead < 12 * 3600e3) { log("Deep reading: the Claude key stopped working recently — trying again later."); return { ok: true }; }
   let dirty = false;
@@ -107,7 +108,7 @@ export async function runDeep(o = {}) {
       const { system, prompt } = buildPrompt(d.name, sym, d.type, d.date, sel);
       let ans;
       try { ans = await askClaude(F, ckey, system, prompt, null, st); }
-      catch (e) { if (e.fatal) { ix.keyDead = Date.now(); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); log("Deep reading: " + e.message + " — stopping (the normal readers carry on with the free AIs)."); publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
+      catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); log("Deep reading: " + e.message + (st.modelList ? ` [models this key can use: ${st.modelList.slice(0, 12).join(", ") || "none listed"}]` : "") + " — stopping (the normal readers carry on with the free AIs)."); publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
         mark(0, String(e.message || e).slice(0, 150)); continue; }
       const raw = parseFacts(ans.text); if (!raw) { mark(0, `${ans.model}: answer was not readable`); continue; }
       const fv = verifyFacts(raw, pages), rawNotes = parseNotes(ans.text), nv = verifyNotes(rawNotes, [pagesRaw, pages]);

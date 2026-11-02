@@ -14,7 +14,8 @@ import { join } from "node:path";
 export const METRICS = ["revenue", "revenue_share", "sales_volume", "production", "capacity", "utilisation", "capacity_addition", "capex", "realisation", "margin", "ebitda", "order_book",
   "market_share", "market_size", "export_share", "geography_revenue", "countries_served", "customer_share", "customer_count", "plants", "cost_share", "guidance", "other"];
 export const NOTE_TOPICS = ["what_they_do", "customers", "markets", "plants", "market_position", "guidance", "costs"];
-export const READER_VERSION = 2;                              // documents read by an older reader are read again once
+export const READER_VERSION = 2;
+export const COMMIT_KINDS = ["revenue_growth", "volume_growth", "margin", "profit", "capacity", "capex", "commissioning", "launch", "order_inflow", "debt", "market_share", "other"];                              // documents read by an older reader are read again once
 const KW = /capacit|utili[sz]|\bMTPA\b|\bKTPA\b|\bTPA\b|\btonnes?\b|\bMT\b|\bKL\b|\bKLPD\b|\bMW\b|\bGW\b|volume|production|product|segment|revenue mix|sales mix|plant|expansion|capex|commission|realis|realiz|market share|order book|EBITDA|margin|units|brownfield|greenfield|debottleneck/gi;
 // each kind of fact has its own words, so the best pages for EVERY kind are sent — not only the capacity pages
 const CATS = {
@@ -59,7 +60,7 @@ export function selectPages(pages, budget = 22000) {
   return [...pick].map(([i, text]) => ({ page: i + 1, text })).sort((a, b) => a.page - b.page);
 }
 
-export function buildPrompt(company, symbol, type, date, sel) {
+export function buildPrompt(company, symbol, type, date, sel, opt = {}) {
   const system = "You extract business facts from an Indian listed company's document for investors. Reply with JSON only.";
   const prompt = `Company: ${company} (NSE: ${symbol}). Document: ${type}, dated ${date}.
 Read the pages below and list what an investor needs to understand the business on the ground.
@@ -83,7 +84,16 @@ B) "notes": short sentences COPIED WORD-FOR-WORD from the pages (not summaries) 
 
 Rules: copy numbers and sentences exactly; never calculate, convert, round, summarise or guess; skip anything unclear;
 at most 100 facts and 24 notes (at most 4 notes per topic); prefer the most recent period.
-Reply as {"facts":[{"item":"","metric":"","period":"","value":"","unit":"","page":0}],"notes":[{"topic":"","text":"","page":0}]}
+${opt.ext ? `
+C) "commitments": forward-looking promises or targets stated by management (growth, margins, capacity, capex, plant commissioning,
+ product launches, order inflow, debt reduction, market share). For each: "what" (short, as written), "kind" (one of ${COMMIT_KINDS.join(", ")}),
+ "target" (the target exactly as written, e.g. "18-20%", "₹500 crore", "1 MTPA"), "value" (the main number in the target, or null), "unit",
+ "by" (the deadline/period exactly as written, e.g. "FY27", "Q3 FY27", "by March 2027"; "" if none), "text" (the sentence COPIED word-for-word, 8–45 words), "page". At most 12.
+${/transcript/i.test(type) ? `D) "concerns": the most important questions analysts asked about risks, problems or doubts. For each: "topic" (2–4 words),
+ "text" (the question COPIED word-for-word, 8–45 words), "answer" (management's key reply sentence COPIED word-for-word, or "" if none), "page". At most 6.
+` : ""}E) "competitors": names of other companies mentioned as competitors or peers, exactly as written. At most 8.
+F) "tags": 3–6 short lowercase product/industry categories that describe what this company sells (e.g. "centrifugal pumps", "industrial valves").
+Reply as {"facts":[...],"notes":[...],"commitments":[{"what":"","kind":"","target":"","value":null,"unit":"","by":"","text":"","page":0}],"concerns":[{"topic":"","text":"","answer":"","page":0}],"competitors":[""],"tags":[""]}` : `Reply as {"facts":[{"item":"","metric":"","period":"","value":"","unit":"","page":0}],"notes":[{"topic":"","text":"","page":0}]}`}
 ${sel.map(p => `\n=== PAGE ${p.page} ===\n${p.text}`).join("\n")}`;
   return { system, prompt };
 }
@@ -140,6 +150,46 @@ export function verifyNotes(notes, pagesSets) {
     const key = best.quote.toLowerCase(); if (seen.has(key)) continue; seen.add(key); per[topic] = (per[topic] || 0) + 1;
     out.push({ item: best.quote.slice(0, 80), metric: "note:" + topic, period: "", value: null, vtext: topic, unit: "", page: best.page, quote: best.quote });
   }
+  return out;
+}
+
+// one sentence the AI says it copied: find it on the page (or elsewhere in the document) — returns the quote cut from the PDF itself
+export function findQuote(text, page, pagesSets) {
+  const toks = s => String(s || "").split(/\s+/).filter(Boolean), nrm = w => w.toLowerCase().replace(/[^a-z0-9%]/g, "");
+  const want = toks(text).map(nrm).filter(w => w.length >= 2); if (want.length < 5 || want.length > 80) return null;
+  let best = null;
+  const tryPage = (pages, pi) => {
+    if (pi < 0 || pi >= pages.length || !pages[pi]) return;
+    const orig = toks(pages[pi]), low = orig.map(nrm), L = want.length, W = L + Math.ceil(L * 0.3);
+    for (let s = 0; s + Math.min(L, low.length) <= low.length; s++) {
+      if (low[s] !== want[0] && low[s] !== want[1] && low[s] !== want[2]) continue;
+      const bag = new Map(); low.slice(s, s + W).forEach(w => bag.set(w, (bag.get(w) || 0) + 1));
+      let hit = 0; for (const w of want) { const c = bag.get(w) || 0; if (c > 0) { hit++; bag.set(w, c - 1); } }
+      const cov = hit / L; if (cov >= 0.86 && (!best || cov > best.cov)) { let e = s, k = 0; for (let j = s; j < Math.min(low.length, s + W) && k < L; j++) if (want.includes(low[j])) { k++; e = j; } best = { cov, page: pi + 1, quote: orig.slice(s, e + 1).join(" ").slice(0, 420) }; }
+    }
+  };
+  const pg = Math.round(+page) - 1;
+  for (const pages of pagesSets) { if (pages) tryPage(pages, pg); if (best && best.cov === 1) break; }
+  if (!best) for (const pages of pagesSets) { if (!pages) continue; for (let i = 0; i < pages.length && !best; i++) if (i !== pg) tryPage(pages, i); if (best) break; }
+  return best;
+}
+// commitments, analyst concerns, competitors and product tags (deep reader): sentences must be on the page, names in the document
+export function parseExtras(text, pagesSets) {
+  let j = null; { const s = String(text || ""); const a = s.indexOf("{"), b = s.lastIndexOf("}"); try { j = JSON.parse(s.slice(a, b + 1)); } catch (e) { j = salvageJson(s); } }
+  const out = { commitments: [], concerns: [], competitors: [], tags: [] }; if (!j) return out;
+  const all = (pagesSets.find(Boolean) || []).join("\n").toLowerCase();
+  for (const c of (Array.isArray(j.commitments) ? j.commitments : []).slice(0, 15)) {
+    if (!c || typeof c !== "object") continue; const q = findQuote(c.text, c.page, pagesSets); if (!q) continue;
+    const v = c.value == null || c.value === "" ? null : Number(String(c.value).replace(/,/g, ""));
+    out.commitments.push({ what: String(c.what || "").slice(0, 120), kind: COMMIT_KINDS.includes(String(c.kind)) ? String(c.kind) : "other", target: String(c.target || "").slice(0, 60), value: isFinite(v) ? v : null, unit: String(c.unit || "").slice(0, 20), by: String(c.by || "").slice(0, 40), quote: q.quote, page: q.page });
+  }
+  for (const c of (Array.isArray(j.concerns) ? j.concerns : []).slice(0, 8)) {
+    if (!c || typeof c !== "object") continue; const q = findQuote(c.text, c.page, pagesSets); if (!q) continue;
+    const a = c.answer ? findQuote(c.answer, c.page, pagesSets) : null;
+    out.concerns.push({ topic: String(c.topic || "").slice(0, 40), quote: q.quote, page: q.page, answer: a ? a.quote : "", apage: a ? a.page : null });
+  }
+  out.competitors = [...new Set((Array.isArray(j.competitors) ? j.competitors : []).map(x => String(x || "").trim()).filter(x => x.length >= 3 && x.length <= 60 && all.includes(x.toLowerCase())))].slice(0, 10);
+  out.tags = [...new Set((Array.isArray(j.tags) ? j.tags : []).map(x => String(x || "").toLowerCase().replace(/[^a-z0-9 &\-]/g, "").trim()).filter(x => x.length >= 3 && x.length <= 40))].slice(0, 6);
   return out;
 }
 

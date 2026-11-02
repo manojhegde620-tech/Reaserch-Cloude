@@ -56,11 +56,18 @@ export async function runMirror(o = {}) {
   await save("/api/db?stats=1");
   await save("/api/db?world=1");                                   // World watch (public data only)
   if (!man.screenT || Date.now() - man.screenT > 6 * 3600e3) { man.screenT = Date.now();
-  for (const v of ["consolidated", "standalone"]) for (let p = 0; p < 30 && Date.now() < until; p++) {
-    const base = { screen: "1", view: v, sort: "mcap", dir: "desc", page: String(p) };
-    const j = await save("/api/db?" + new URLSearchParams(base)); if (lr.qe) await save("/api/db?" + new URLSearchParams({ ...base, qe: lr.qe }));
-    if (!j || !(j.rows || []).length || (p + 1) * (j.size || 100) >= (j.total || 0)) break;
-  } }
+    // ONE database query per view (all rows), cut here into the same 100-row pages the app asks for — instead of ~50 paged queries
+    for (const v of ["consolidated", "standalone"]) for (const qe of [null, lr.qe].filter((x, i) => i === 0 || x)) {
+      const base = { screen: "1", view: v, sort: "mcap", dir: "desc" }; if (qe) base.qe = qe;
+      let j = null; try { const r = await F(`${server}/api/db?${new URLSearchParams({ ...base, all: "1" })}`, { headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }); if (r.ok) j = await r.json(); } catch (e) {}
+      if (!good(j) || !j.all) { failed++; continue; }
+      const rows = j.rows || [];
+      for (let p = 0; p * 100 < Math.max(1, rows.length) && p < 60; p++) {
+        const page = { ok: true, qe: j.qe, view: j.view, sort: j.sort, dir: j.dir, page: p, size: 100, total: j.total, rows: rows.slice(p * 100, p * 100 + 100), _mirror: Date.now() };
+        const fp = join(dir, mirrorPath(mirrorKey("/api/db?" + new URLSearchParams({ ...base, page: String(p) })))); mkdirSync(join(fp, ".."), { recursive: true }); writeFileSync(fp, JSON.stringify(page)); saved++;
+        if (p === 0) { const fp0 = join(dir, mirrorPath(mirrorKey("/api/db?" + new URLSearchParams(base)))); mkdirSync(join(fp0, ".."), { recursive: true }); writeFileSync(fp0, JSON.stringify(page)); }   // the app may ask without page=0
+      }
+    } }
   // results list: latest + each of the last 7 days, and the result cards the list does not already carry
   const cards = new Set();
   for (const d of [null, ...istDates(7)]) {

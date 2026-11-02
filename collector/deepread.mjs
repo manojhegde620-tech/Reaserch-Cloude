@@ -10,7 +10,9 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, pdfTextPoppler, askClaude, claudeCost, READER_VERSION } from "./insights.mjs";
+import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, parseExtras, pdfTextPoppler, askClaude, claudeCost, READER_VERSION } from "./insights.mjs";
+import { shpPledge, xbrlNum } from "./companyinfo.mjs";
+export const DEEP_VERSION = 2;                 // v2: + management commitments, analyst concerns, competitors, product tags, red flags, holding, insider trades
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const REF = "https://www.nseindia.com/companies-listing/corporate-filings-announcements";
@@ -19,16 +21,44 @@ const dmy = d => `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMo
 export const BRANCH = "deep-data";
 
 // which documents of a company to read: the latest transcript, the latest presentation, the latest annual report
-export function pickDocs(sym, ann, ars) {
+export function pickDocs(sym, ann, ars, nTr = 1) {
   const txt = r => `${r.desc || ""} ${r.attchmntText || ""} ${r.attchmntFile || ""}`;
   const pdf = r => /\.pdf$/i.test(String(r.attchmntFile || ""));
   const mk = type => r => ({ symbol: sym, name: r.sm_name || sym, doc: r.attchmntFile, type, date: String(r.an_dt || r.sort_date || "").slice(0, 11) });
   const out = [
-    ...ann.filter(r => pdf(r) && /transcript/i.test(txt(r)) && !/investor presentation/i.test(String(r.desc || ""))).slice(0, 1).map(mk("Earnings call transcript")),
+    ...ann.filter(r => pdf(r) && /transcript/i.test(txt(r)) && !/investor presentation/i.test(String(r.desc || ""))).filter((r, i, arr) => arr.findIndex(x => x.attchmntFile === r.attchmntFile) === i).slice(0, nTr).map(mk("Earnings call transcript")),
     ...ann.filter(r => pdf(r) && /investor presentation/i.test(String(r.desc || ""))).slice(0, 1).map(mk("Investor presentation")),
     ...ars.filter(r => /\.pdf$/i.test(String(r.fileName || ""))).slice(0, 1).map(r => ({ symbol: sym, name: r.companyName || sym, doc: r.fileName, type: `Annual report ${r.fromYr || ""}-${r.toYr || ""}`, date: String(r.broadcast_dttm || "").slice(0, 11) })),
   ];
   return out.filter(d => d.doc);
+}
+
+// red flags and notable events from the company's own NSE announcements (no AI: the announcement subject decides)
+const FLAG_RULES = [
+  ["red", "Auditor resigned", /auditor/i, /resign|cessation|withdraw/i],
+  ["red", "Key person resigned", /\b(cfo|chief financial|ceo|chief executive|managing director|whole[- ]?time director|company secretary|compliance officer|key managerial|kmp)\b/i, /resign|cessation/i],
+  ["red", "Rating downgrade / negative watch", /rating/i, /downgrad|negative (outlook|watch)|watch with negative|withdraw|suspend|default/i],
+  ["red", "Default / delay in payment", /default|delay in (payment|servicing)|non[- ]payment|overdue/i, null],
+  ["red", "Regulatory / legal action", /penalt|show cause|tax demand|demand notice|search (and|&) seizure|\braid\b|fraud|insolvency|\bnclt\b|\bcirp\b|forensic|adjudication|sebi order|ed\b.*attach/i, null],
+  ["amber", "Promoter pledge / encumbrance", /pledge|encumbr/i, null],
+  ["amber", "Director resigned", /director/i, /resign|cessation/i],
+  ["green", "Rating upgrade", /rating/i, /upgrad|positive outlook/i],
+  ["green", "Buyback / bonus / split", /buy ?back|bonus|split|sub-division/i, null],
+  ["green", "Order / contract won", /order|contract|letter of award|\bloa\b|work order/i, /receiv|win|won|bag|secur|award/i],
+  ["green", "Capacity / plant commissioned", /commission|commercial production|capacity expansion|new plant/i, null],
+  ["info", "Acquisition / merger / fund raise", /acquisi|amalgamat|merger|scheme of arrangement|preferential|\bqip\b|rights issue|fund raising/i, null],
+];
+export function deepSignals(ann) {
+  const flags = [], seen = new Set();
+  for (const r of ann || []) {
+    const txt = `${r.desc || ""} ${r.attchmntText || ""}`.replace(/\s+/g, " ").trim(); if (!txt) continue;
+    for (const [lvl, label, a, b] of FLAG_RULES) {
+      if (!a.test(txt) || (b && !b.test(txt))) continue;
+      const k = label + "|" + String(r.an_dt || r.sort_date || "").slice(0, 11); if (seen.has(k)) break; seen.add(k);
+      flags.push({ lvl, label, date: String(r.an_dt || r.sort_date || "").slice(0, 11), text: txt.slice(0, 220), url: r.attchmntFile || "" }); break;
+    }
+  }
+  return flags.slice(0, 40);
 }
 
 export async function runDeep(o = {}) {
@@ -100,54 +130,90 @@ export async function runDeep(o = {}) {
   const pdfText = o.pdfText || pdfTextPoppler;
   await session();
   const st = { inTok: 0, outTok: 0 }, spent0 = ix.spent || 0; let docs = 0, facts = 0, cos = 0, blocked = 0, sinceSave = 0, busyRun = 0, stopRun = false;
-  const to = new Date(), from = new Date(Date.now() - 400 * 864e5);
-  let dn = 0; const dlog = m => log(`  doc ${dn}: ${m}`);                 // (public log: no company names)
-  for (const sym of tg.symbols) {
-    if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break;
-    const c = ix.companies[sym]; if (c && c.t && Date.now() - c.t < 120 * 864e5) continue;          // read in the last 4 months
-    const a = await nseJson(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from)}&to_date=${dmy(to)}`);
-    const ar = await nseJson(`https://www.nseindia.com/api/annual-reports?index=equities&symbol=${encodeURIComponent(sym)}`);
-    if (a.code !== 200 && ar.code !== 200) { blocked++; if (blocked >= 5) { log("Deep reading: NSE keeps refusing — stopping for this run."); break; } await sleep(15000 * blocked); await session(); continue; }
+  const to = new Date(), from = new Date(Date.now() - 400 * 864e5), from2 = new Date(Date.now() - 800 * 864e5);
+  let dn = 0; const dlog = (id, m) => log(`  doc ${id}: ${m}`);                 // (public log: no company names)
+  let gateT = 0; const gate = async () => { const w = Math.max(0, gateT - Date.now()); gateT = Math.max(Date.now(), gateT) + (o.nseGap ?? 450); if (w) await sleep(w); };   // NSE: one request at a time, spaced
+  const nseG = async url => { await gate(); return nseJson(url); };
+  const deepTr = o.deepTranscripts || 4, deepN = o.deepCount || 300;      // big companies + your watchlist: 4 transcripts (for promises vs delivery), others: 2
+  const order = new Map(tg.symbols.map((x, i) => [x, i]));
+  async function readDoc(sym, co, d) {
+    const id = ++dn;
+    const mark = (s, note, extra = {}) => { const tries = ((ix.docs[d.doc] || {}).n || 0) + (s === 0 && !extra.transient ? 1 : 0); ix.docs[d.doc] = { s: s === 0 && tries >= 3 ? 2 : s, n: tries, v: DEEP_VERSION };
+      co.docs = co.docs.filter(x => x.doc !== d.doc); co.docs.push({ doc: d.doc, symbol: sym, type: d.type, date: d.date, status: ix.docs[d.doc].s, model: extra.model || "", n: extra.n || 0, note, t: Date.now(), source: "deep" }); };
+    const tD = Date.now(); const r = await pdfGet(d.doc); const dlS = Math.round((Date.now() - tD) / 1000);
+    if (r.code !== 200 || !r.body || r.body.length < 1000) { mark(0, `could not download (${r.why || "HTTP " + r.code})`); dlog(id, `could not download after ${dlS}s (${r.why || "HTTP " + r.code})`); return; }
+    if (r.body.length > 40 * 1024 * 1024) { mark(2, "file too large"); return; }
+    let pages = []; try { pages = await pdfText(r.body); } catch (e) { mark(0, "PDF damaged or incomplete"); return; }
+    if (pages.join("").replace(/\s/g, "").length < 120) { mark(2, "no text in PDF (scanned images)"); return; }
+    if (!/presentation|annual report/i.test(d.type) && pages.filter(p => p.trim().length > 200).length <= 2 && pages.join("").length < 5000) { mark(1, "covering letter only — the document itself is on the company's website"); return; }
+    let pagesRaw = null; if (pdfText === pdfTextPoppler) { try { pagesRaw = await pdfTextPoppler(r.body, false); } catch (e) {} }
+    const sel = selectPages(pages, Math.round(budgetFor(d.type) * 1.5)); if (!sel.length) { mark(1, "no business pages found"); return; }
+    const { system, prompt } = buildPrompt(d.name, sym, d.type, d.date, sel, { ext: true });
+    let ans; const tA = Date.now();
+    try { ans = await askClaude(F, ckey, system, prompt, m => dlog(id, m.trim()), st); }
+    catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; log("Deep reading: " + e.message + (st.modelList ? ` [models this key can use: ${st.modelList.slice(0, 12).join(", ") || "none listed"}]` : "") + " — stopping (the normal readers carry on with the free AIs)."); return; }
+      if (e.busy) { mark(0, String(e.message || e).slice(0, 150), { transient: true }); dlog(id, String(e.message || e).slice(0, 120)); if (++busyRun >= 3) { log("Deep reading: Claude keeps saying busy / rate limit — stopping this run."); stopRun = true; } return; }
+      mark(0, String(e.message || e).slice(0, 150)); return; }
+    const raw = parseFacts(ans.text); if (!raw) { mark(0, `${ans.model}: answer was not readable`); dlog(id, `${ans.model}: answer was not readable`); return; }
+    const fv = verifyFacts(raw, pages), rawNotes = parseNotes(ans.text), nv = verifyNotes(rawNotes, [pagesRaw, pages]);
+    const ex = parseExtras(ans.text, [pagesRaw, pages]);
+    co.facts = co.facts.filter(x => x.doc !== d.doc).concat([...fv, ...nv].map(x => ({ symbol: sym, doc: d.doc, ...x })));
+    co.commitments = (co.commitments || []).filter(x => x.doc !== d.doc).concat(ex.commitments.map(c => ({ doc: d.doc, date: d.date, type: d.type, ...c })));
+    co.concerns = (co.concerns || []).filter(x => x.doc !== d.doc).concat(ex.concerns.map(c => ({ doc: d.doc, date: d.date, ...c })));
+    co.competitors = [...new Set([...(co.competitors || []), ...ex.competitors])].slice(0, 15);
+    const tg2 = { ...(co.tagN || {}) }; for (const t of ex.tags) tg2[t] = (tg2[t] || 0) + 1; co.tagN = tg2; co.tags = Object.entries(tg2).sort((a, b) => b[1] - a[1]).map(x => x[0]).slice(0, 8);
+    mark(1, `${raw.length} numbers found by AI, ${fv.length} confirmed on the page; ${nv.length} of ${rawNotes.length} quotes confirmed; ${ex.commitments.length} commitments`, { model: ans.model, n: fv.length + nv.length });
+    docs++; facts += fv.length + nv.length; busyRun = 0;
+    dlog(id, `download ${dlS}s, AI ${Math.round((Date.now() - tA) / 1000)}s — ${fv.length + nv.length} checked facts, ${ex.commitments.length} commitments, ${ex.concerns.length} concerns [${ans.model}]`);
+  }
+  async function companyExtras(sym, co) {             // promoter holding + pledge (shareholding pattern) and insider trades — refreshed monthly
+    if (co.hx && Date.now() - co.hx < 30 * 864e5) return;
+    try {
+      const sh = await nseG(`https://www.nseindia.com/api/corporate-share-holdings-master?index=equities&symbol=${encodeURIComponent(sym)}`);
+      const list0 = sh.j ? (Array.isArray(sh.j) ? sh.j : (sh.j.data || [])) : []; const num = v => { const n = parseFloat(String(v ?? "").replace(/,/g, "")); return isFinite(n) ? n : null; };
+      const dtp = x => { const d = Date.parse(String(x || "").replace(/-/g, " ")); return isNaN(d) ? 0 : d; };
+      const list = list0.filter(r => r && r.date && num(r.pr_and_prgrp) != null).sort((a, b) => dtp(b.date) - dtp(a.date)); const seen = new Set();
+      if (list.length) co.holding = list.filter(r => !seen.has(r.date) && seen.add(r.date)).slice(0, 8).map(r => ({ d: r.date, p: num(r.pr_and_prgrp), pub: num(r.public_val) }));
+      if (list[0] && list[0].xbrl && !o.skipShp) { await gate(); const x = await pdfGet(list[0].xbrl); if (x.code === 200 && x.body) { const xml = x.body.toString("utf8"); co.pledge = { ...shpPledge(xml), d: list[0].date }; } }
+    } catch (e) {}
+    try {
+      const pit = await nseG(`https://www.nseindia.com/api/corporates-pit?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from)}&to_date=${dmy(to)}`);
+      const rows = pit.j ? (Array.isArray(pit.j) ? pit.j : (pit.j.data || [])) : [];
+      if (pit.code === 200) {
+        const num = v => { const n = parseFloat(String(v ?? "").replace(/,/g, "")); return isFinite(n) ? n : 0; };
+        const tr = rows.map(r => ({ d: String(r.acqfromDt || r.date || r.intimDt || "").slice(0, 11), who: String(r.acqName || "").slice(0, 60), cat: String(r.personCategory || "").slice(0, 40), type: String(r.tdpTransactionType || r.acqMode || "").slice(0, 30), qty: num(r.secAcq), val: num(r.secVal) }));
+        const sum = re => { let b = 0, s2 = 0; for (const t of tr) if (re.test(t.cat)) { if (/buy|acqui/i.test(t.type)) b += t.val; else if (/sell|dispos/i.test(t.type)) s2 += t.val; } return { buy: Math.round(b), sell: Math.round(s2) }; };
+        co.insider = { t: Date.now(), promoters: sum(/promoter/i), directors: sum(/director|kmp|key managerial|designated/i), rows: tr.slice(0, 30) };
+      }
+    } catch (e) {}
+    co.hx = Date.now();
+  }
+  async function processCo(sym) {
+    const c = ix.companies[sym]; if (c && c.t && c.v >= DEEP_VERSION && Date.now() - c.t < 120 * 864e5) return;          // read in the last 4 months
+    const nTr = (order.get(sym) ?? 9999) < deepN ? deepTr : 2;
+    const a = await nseG(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(nTr > 2 ? from2 : from)}&to_date=${dmy(to)}`);
+    const ar = await nseG(`https://www.nseindia.com/api/annual-reports?index=equities&symbol=${encodeURIComponent(sym)}`);
+    if (a.code !== 200 && ar.code !== 200) { blocked++; if (blocked >= 5) { log("Deep reading: NSE keeps refusing — stopping for this run."); stopRun = true; return; } await sleep(15000 * blocked); await session(); return; }
     blocked = 0;
     const ann = a.j ? (Array.isArray(a.j) ? a.j : (a.j.data || [])) : []; const ars = ar.j ? (ar.j.data || []) : [];
-    const list = pickDocs(sym, ann, ars).filter(d => !(ix.docs[d.doc] && (ix.docs[d.doc].s === 1 || ix.docs[d.doc].s === 2)));
+    const list = pickDocs(sym, ann, ars, nTr).filter(d => { const x = ix.docs[d.doc]; return !(x && (x.s === 2 || (x.s === 1 && x.v >= DEEP_VERSION))); });
     const co = loadCo(sym);
-    for (const d of list) {
-      if (Date.now() > until - 120000 || docs >= maxDocs) break;
-      dn++;
-      const mark = (s, note, extra = {}) => { const tries = ((ix.docs[d.doc] || {}).n || 0) + (s === 0 && !extra.transient ? 1 : 0); ix.docs[d.doc] = { s: s === 0 && tries >= 3 ? 2 : s, n: tries };
-        co.docs = co.docs.filter(x => x.doc !== d.doc); co.docs.push({ doc: d.doc, symbol: sym, type: d.type, date: d.date, status: ix.docs[d.doc].s, model: extra.model || "", n: extra.n || 0, note, t: Date.now(), source: "deep" }); };
-      const tD = Date.now(); const r = await pdfGet(d.doc); const dlS = Math.round((Date.now() - tD) / 1000);
-      if (r.code !== 200 || !r.body || r.body.length < 1000) { mark(0, `could not download (${r.why || "HTTP " + r.code})`); dlog(`could not download after ${dlS}s (${r.why || "HTTP " + r.code})`); continue; }
-      if (r.body.length > 40 * 1024 * 1024) { mark(2, "file too large"); continue; }
-      let pages = []; try { pages = await pdfText(r.body); } catch (e) { mark(0, "PDF damaged or incomplete"); continue; }
-      if (pages.join("").replace(/\s/g, "").length < 120) { mark(2, "no text in PDF (scanned images)"); continue; }
-      if (!/presentation|annual report/i.test(d.type) && pages.filter(p => p.trim().length > 200).length <= 2 && pages.join("").length < 5000) { mark(1, "covering letter only — the document itself is on the company's website"); continue; }
-      let pagesRaw = null; if (pdfText === pdfTextPoppler) { try { pagesRaw = await pdfTextPoppler(r.body, false); } catch (e) {} }
-      const sel = selectPages(pages, Math.round(budgetFor(d.type) * 1.5)); if (!sel.length) { mark(1, "no business pages found"); continue; }
-      const { system, prompt } = buildPrompt(d.name, sym, d.type, d.date, sel);
-      let ans;
-      const tA = Date.now();
-      try { ans = await askClaude(F, ckey, system, prompt, m => dlog(m.trim()), st); }
-      catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); log("Deep reading: " + e.message + (st.modelList ? ` [models this key can use: ${st.modelList.slice(0, 12).join(", ") || "none listed"}]` : "") + " — stopping (the normal readers carry on with the free AIs)."); publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
-        if (e.busy) { mark(0, String(e.message || e).slice(0, 150), { transient: true }); dlog(String(e.message || e).slice(0, 120)); if (++busyRun >= 3) { log("Deep reading: Claude keeps saying busy / rate limit — stopping this run."); stopRun = true; break; } continue; }
-        mark(0, String(e.message || e).slice(0, 150)); continue; }
-      const raw = parseFacts(ans.text); if (!raw) { mark(0, `${ans.model}: answer was not readable`); dlog(`${ans.model}: answer was not readable`); continue; }
-      const fv = verifyFacts(raw, pages), rawNotes = parseNotes(ans.text), nv = verifyNotes(rawNotes, [pagesRaw, pages]);
-      co.facts = co.facts.filter(x => x.doc !== d.doc).concat([...fv, ...nv].map(x => ({ symbol: sym, doc: d.doc, ...x })));
-      mark(1, `${raw.length} numbers found by AI, ${fv.length} confirmed on the page; ${nv.length} of ${rawNotes.length} quotes confirmed`, { model: ans.model, n: fv.length + nv.length });
-      docs++; facts += fv.length + nv.length; busyRun = 0;
-      dlog(`download ${dlS}s, AI ${Math.round((Date.now() - tA) / 1000)}s — ${fv.length + nv.length} checked facts [${ans.model}]`);
-    }
-    co.name = (list[0] && list[0].name) || co.name || sym; co.t = Date.now(); co.reader = READER_VERSION;
-    const pending = co.docs.some(x => x.status === 0);       // a document to retry → the company comes back next run
-    ix.companies[sym] = { t: pending ? 0 : Date.now(), docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length };
+    co.flags = deepSignals(ann.filter(r => Date.parse(String(r.an_dt || r.sort_date || "").replace(/-/g, " ")) > Date.now() - 400 * 864e5));
+    await companyExtras(sym, co);
+    for (const d of list) { if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break; await readDoc(sym, co, d); }
+    co.name = (list[0] && list[0].name) || co.name || (ann[0] && ann[0].sm_name) || sym; co.t = Date.now(); co.reader = READER_VERSION; co.v = DEEP_VERSION;
+    const pending = co.docs.some(x => x.status === 0) || list.some(d => !ix.docs[d.doc]);     // a document to retry / not reached → back next run
+    ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length };
     saveCo(sym, co); cos++; sinceSave++;
     ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
-    if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); break; }
-    if (sinceSave >= 15) { sinceSave = 0; publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }
-    await sleep(300);
+    if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
+    if (sinceSave >= 20) { sinceSave = 0; publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }
   }
+  // several companies at once (each still reads its documents one by one); NSE requests stay spaced out
+  let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);
+  const worker = async () => { while (!stopRun && Date.now() < until - 120000 && docs < maxDocs) { const sym = tg.symbols[next++]; if (sym === undefined) break; try { await processCo(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
+  await Promise.all(Array.from({ length: par }, worker));
+  if (ix.keyDead) { ix.spent = +(spent0 + claudeCost(st)).toFixed(4); publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
   ix.inTok = (ix.inTok || 0) + st.inTok; ix.outTok = (ix.outTok || 0) + st.outTok; ix.t = Date.now();
   publish(`deep reading: ${Object.keys(ix.companies).length} companies`);
   const total = tg.symbols.length, have = Object.keys(ix.companies).length;

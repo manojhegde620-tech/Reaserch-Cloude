@@ -14,6 +14,7 @@ import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFact
 import { shpPledge, xbrlNum } from "./companyinfo.mjs";
 import { evaluatePromises, dueOf, JUDGE_RULES } from "./promises.mjs";
 import { tidyCompany, TIDY_VERSION } from "./tidy.mjs";
+import { sealText, openText, sealOn, sealTree } from "./seal.mjs";
 export const DEEP_VERSION = 2;                 // v2: + management commitments, analyst concerns, competitors, product tags, red flags, holding, insider trades
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
@@ -84,18 +85,19 @@ export async function runDeep(o = {}) {
   } else mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, "d"), { recursive: true });
   const ixPath = join(dir, "d", "index.json");
-  let ix = { v: 1, companies: {}, docs: {}, spent: 0, inTok: 0, outTok: 0 }; try { if (existsSync(ixPath)) ix = { ...ix, ...JSON.parse(readFileSync(ixPath, "utf8")) }; } catch (e) {}
+  let ix = { v: 1, companies: {}, docs: {}, spent: 0, inTok: 0, outTok: 0 }; try { if (existsSync(ixPath)) { const o = await openText(readFileSync(ixPath, "utf8")); if (o) ix = { ...ix, ...o }; } } catch (e) {}
   if (!(ix.v >= 2)) { for (const [k, v] of Object.entries(ix.docs || {})) if (v.s === 0) delete ix.docs[k]; ix.v = 2; }
   if (ix.spent >= cap) { log(`Deep reading: the budget of $${cap} is used ($${ix.spent.toFixed(2)}) — stopping.`); return { ok: true, done: true }; }
   if (ix.keyDead && Date.now() - ix.keyDead < 12 * 3600e3) { log("Deep reading: the Claude key stopped working recently — trying again later."); return { ok: true }; }
   let dirty = false;
-  const saveCo = (sym, co) => { writeFileSync(join(dir, "d", sym + ".json"), JSON.stringify(co)); dirty = true; };
-  const loadCo = sym => { try { return JSON.parse(readFileSync(join(dir, "d", sym + ".json"), "utf8")); } catch (e) { return { symbol: sym, docs: [], facts: [] }; } };
-  const publish = (msg) => {
-    writeFileSync(ixPath, JSON.stringify(ix));
+  const saveCo = async (sym, co) => { writeFileSync(join(dir, "d", sym + ".json"), await sealText(co)); dirty = true; };   // sealed when DATA_KEY is set
+  const loadCo = async sym => { try { const o = await openText(readFileSync(join(dir, "d", sym + ".json"), "utf8")); if (o) return o; } catch (e) {} return { symbol: sym, docs: [], facts: [] }; };
+  if (sealOn()) { try { const n = await sealTree(join(dir, "d")); if (n) { dirty = true; log(`Deep reading: ${n} older files sealed (encrypted).`); } } catch (e) {} }
+  const publish = async (msg) => {
+    writeFileSync(ixPath, await sealText(ix));
     // small index for the app's peer comparison: company name, product tags, competitors named in its documents
     const pe = {}; for (const [k, v] of Object.entries(ix.companies || {})) if (v && (v.tg || v.n)) pe[k] = [v.n || "", v.tg || [], v.cp || []];
-    writeFileSync(join(dir, "d", "peers.json"), JSON.stringify(pe));
+    writeFileSync(join(dir, "d", "peers.json"), await sealText(pe));
     if (o.skipGit || !dirty) return; dirty = false;
     try { git("add", "-A"); git("commit", "--quiet", "-m", msg); git("push", "--quiet", "origin", "HEAD:" + BRANCH); log("Deep reading: saved to GitHub (" + msg + ")."); }
     catch (e) { log("Deep reading: could not save to GitHub: " + String((e.stderr && e.stderr.toString()) || e.message || e).replace(/x-access-token:[^@]+@/g, "x-access-token:***@").slice(0, 200)); }
@@ -229,7 +231,7 @@ export async function runDeep(o = {}) {
     blocked = 0;
     const ann = a.j ? (Array.isArray(a.j) ? a.j : (a.j.data || [])) : []; const ars = ar.j ? (ar.j.data || []) : [];
     const list = pickDocs(sym, ann, ars, nTr).filter(d => { const x = ix.docs[d.doc]; return !(x && (x.s === 2 || (x.s === 1 && x.v >= DEEP_VERSION))); });
-    const co = loadCo(sym);
+    const co = await loadCo(sym);
     co.flags = deepSignals(ann.filter(r => Date.parse(String(r.an_dt || r.sort_date || "").replace(/-/g, " ")) > Date.now() - 400 * 864e5));
     await companyExtras(sym, co);
     for (const d of list) { if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break; await readDoc(sym, co, d); }
@@ -238,16 +240,16 @@ export async function runDeep(o = {}) {
     await tidyCo(sym, co);
     const pending = co.docs.some(x => x.status === 0) || list.some(d => !ix.docs[d.doc]);     // a document to retry / not reached → back next run
     ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10), ripe: ripeCount(co), jt: co.jt || 0, tv: co.tv || 0, tdt: co.tdt || 0 };
-    saveCo(sym, co); cos++; sinceSave++;
+    await saveCo(sym, co); cos++; sinceSave++;
     ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
     if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
-    if (sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }   // saved at least every 8 minutes
+    if (sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); await publish(`deep reading: ${Object.keys(ix.companies).length} companies`); }   // saved at least every 8 minutes
   }
   // first: commitments of companies read earlier whose deadline has now passed (weekly check, a few minutes per run)
   { const jUntil = Math.min(until - 120000, Date.now() + (o.judgeMinutes ?? 8) * 60e3); let jn = 0;
     const due = Object.entries(ix.companies).filter(([, c]) => c && c.v >= DEEP_VERSION && c.t && (c.ripe == null || c.ripe > 0 || (c.jr || 0) < JUDGE_RULES) && (Date.now() - (c.jt || 0) > 7 * 864e5 || (c.jr || 0) < JUDGE_RULES)).map(([s]) => s);
-    for (const sym of due) { if (stopRun || Date.now() > jUntil) break; const co = loadCo(sym); const before = co.judged || 0; await judgeCo(sym, co);
-      Object.assign(ix.companies[sym], { ripe: ripeCount(co), jt: co.jt || Date.now(), jr: JUDGE_RULES }); saveCo(sym, co); jn += (co.judged || 0) - before; }
+    for (const sym of due) { if (stopRun || Date.now() > jUntil) break; const co = await loadCo(sym); const before = co.judged || 0; await judgeCo(sym, co);
+      Object.assign(ix.companies[sym], { ripe: ripeCount(co), jt: co.jt || Date.now(), jr: JUDGE_RULES }); await saveCo(sym, co); jn += (co.judged || 0) - before; }
     if (due.length) log(`Deep reading: promises checked for ${Math.min(due.length, jn ? due.length : due.length)} compan${due.length === 1 ? "y" : "ies"} — ${jn} verdicts.`); }
   // then: tidy-up of companies read earlier (once), and of your watchlist companies twice a day — several at once
   let tidyLeft = 0, tidyDone = 0;
@@ -255,17 +257,17 @@ export async function runDeep(o = {}) {
     const due = Object.entries(ix.companies).filter(([s, c]) => c && c.v >= DEEP_VERSION && c.t && (c.tv !== TIDY_VERSION || (watchSet.has(s) && Date.now() - (c.tdt || 0) > 12 * 3600e3)))
       .map(([s]) => s).sort((a, b) => (order.get(a) ?? 9e9) - (order.get(b) ?? 9e9));
     let nx = 0; const tw = async () => { while (!stopRun && Date.now() < tUntil) { const sym = due[nx++]; if (sym === undefined) break;
-      try { const co = loadCo(sym); tn += (await tidyCo(sym, co)) || 0; if (co.tv === TIDY_VERSION) { Object.assign(ix.companies[sym], { tv: co.tv, tdt: co.tdt }); saveCo(sym, co); tc++; } } catch (e) {} } };
+      try { const co = await loadCo(sym); tn += (await tidyCo(sym, co)) || 0; if (co.tv === TIDY_VERSION) { Object.assign(ix.companies[sym], { tv: co.tv, tdt: co.tdt }); await saveCo(sym, co); tc++; } } catch (e) {} } };
     await Promise.all(Array.from({ length: Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4) }, tw));
     tidyLeft = due.length - tc; tidyDone = tc;
-    if (due.length) { log(`Deep reading: tidied ${tc} of ${due.length} companies waiting (${tn} number names given a standard name).`); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); if (tc) publish(`tidy-up: ${tc} companies`); } }
+    if (due.length) { log(`Deep reading: tidied ${tc} of ${due.length} companies waiting (${tn} number names given a standard name).`); ix.spent = +(spent0 + claudeCost(st)).toFixed(4); if (tc) await publish(`tidy-up: ${tc} companies`); } }
   // several companies at once (each still reads its documents one by one); NSE requests stay spaced out
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);
   const worker = async () => { while (!stopRun && Date.now() < until - 120000 && docs < maxDocs) { const sym = tg.symbols[next++]; if (sym === undefined) break; try { await processCo(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
   await Promise.all(Array.from({ length: par }, worker));
-  if (ix.keyDead) { ix.spent = +(spent0 + claudeCost(st)).toFixed(4); publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
+  if (ix.keyDead) { ix.spent = +(spent0 + claudeCost(st)).toFixed(4); await publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
   ix.inTok = (ix.inTok || 0) + st.inTok; ix.outTok = (ix.outTok || 0) + st.outTok; ix.t = Date.now();
-  publish(`deep reading: ${Object.keys(ix.companies).length} companies`);
+  await publish(`deep reading: ${Object.keys(ix.companies).length} companies`);
   const total = tg.symbols.length, have = Object.keys(ix.companies).length;
   log(`Deep reading: ${cos} companies, ${docs} documents, ${facts} checked facts this run · ${have} of ${total} companies done · Claude cost so far ≈ $${ix.spent.toFixed(2)} (this run ≈ $${claudeCost(st).toFixed(2)}).`);
   // more to read and this run made progress → tell the workflow to start the next run straight away (no waiting for the clock)

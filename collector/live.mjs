@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runWorld } from "./world.mjs";
+import { sealText, openText, sealOn, sealTree } from "./seal.mjs";
 
 export const LIVE_VERSION = 1;
 export const BRANCH = "co-data";
@@ -52,8 +53,11 @@ export async function runLive(o = {}) {
   const stPath = join(dir, "c", "_state.json");
   let st = { v: LIVE_VERSION, seen: {}, pend: {}, cursor: 0, full: 0, n: 0 }; try { if (existsSync(stPath)) st = { ...st, ...JSON.parse(readFileSync(stPath, "utf8")) }; } catch (e) {}
   const fileOf = sym => join(dir, "c", sym + ".json");
-  const load = sym => { try { return JSON.parse(readFileSync(fileOf(sym), "utf8")); } catch (e) { return null; } };
+  const load = async sym => { try { return await openText(readFileSync(fileOf(sym), "utf8")); } catch (e) { return null; } };   // sealed or plain
+  const ageT = sym => { try { const o = JSON.parse(readFileSync(fileOf(sym), "utf8")); return (o && o.t) || 0; } catch (e) { return null; } };   // the time is outside the seal
+  let sealedN = 0; if (sealOn()) { try { const n = await sealTree(join(dir, "c"), undefined, new Set(["_state.json"])); sealedN = n; if (n) { log(`Live company files: ${n} older files sealed (encrypted).`); } } catch (e) { log("Live company files: sealing skipped — " + String(e.message || e).slice(0, 80)); } }
   let dirty = 0, stDirty = 0, lastPush = now();
+  dirty += sealedN;                              // older plain files were sealed: save them (one commit replaces the branch)
   const publish = (msg, force) => {
     // keep only the newest seen-marks (10 days) so the state file stays small
     const cut = now() - 10 * 864e5; for (const [k, t] of Object.entries(st.seen)) if (t < cut) delete st.seen[k];
@@ -69,7 +73,7 @@ export async function runLive(o = {}) {
   const good = j => j && j.ok && !j.partial && Array.isArray(j.quarters) && j.quarters.length;
   let freshLeft = 0;                             // fresh NSE reads through T-Rex: at most 8 per check (NSE stays friendly)
   async function build(sym, need) {              // → true when the file is complete (and has the quarter needed, if any)
-    const old = load(sym);
+    const old = await load(sym);
     let c = await view(sym, "consolidated"), s = await view(sym, "standalone");
     let file = { v: LIVE_VERSION, sym, t: now(), name: (good(c) && c.name) || (good(s) && s.name) || (old && old.name) || sym, c: good(c) ? c : (old && old.c) || null, s: good(s) ? s : (old && old.s) || null };
     if (need && !hasQe(file, need.qe, need.basis) && freshLeft > 0 && (!st.pend[need.k] || now() - (st.pend[need.k].f || 0) > 30 * 60e3)) {
@@ -79,7 +83,7 @@ export async function runLive(o = {}) {
       if (good(j)) file[fv === "standalone" ? "s" : "c"] = j;
     }
     if (!file.c && !file.s) return false;
-    if (!old || sig(old.c) !== sig(file.c) || sig(old.s) !== sig(file.s) || !old.t || now() - old.t > 6 * 864e5) { writeFileSync(fileOf(sym), JSON.stringify(file)); dirty++; st.n = (st.n || 0) + (old ? 0 : 1); }
+    if (!old || sig(old.c) !== sig(file.c) || sig(old.s) !== sig(file.s) || !old.t || now() - old.t > 6 * 864e5) { writeFileSync(fileOf(sym), await sealText(file)); dirty++; st.n = (st.n || 0) + (old ? 0 : 1); }
     return need ? hasQe(file, need.qe, need.basis) : true;
   }
   // 3) NSE's list of new filings — from GitHub directly; if NSE refuses, T-Rex's own copy of the same list
@@ -134,7 +138,7 @@ export async function runLive(o = {}) {
     if (list.length) {
       if (st.cursor >= list.length && now() - (st.full || 0) > 7 * 864e5) st.cursor = 0;
       st.miss = st.miss || {};
-      const one = async () => { while (st.cursor < list.length && now() < bUntil) { const sym = list[st.cursor++]; stDirty = 1; const f = load(sym); if (f && now() - (f.t || 0) < 6 * 864e5) continue;
+      const one = async () => { while (st.cursor < list.length && now() < bUntil) { const sym = list[st.cursor++]; stDirty = 1; const ft = ageT(sym); if (ft != null && now() - ft < 6 * 864e5) continue;
         if (await build(sym, null)) { filled++; delete st.miss[sym]; } else st.miss[sym] = now(); if (o.gap) await sleep(o.gap); } };
       await Promise.all([one(), one(), one()]);
       // companies whose database copy was not complete yet: tried again every 30 minutes (database only — never NSE)
@@ -144,9 +148,9 @@ export async function runLive(o = {}) {
     }
     // c) World watch every 30 minutes: saved here (the app reads it from GitHub) and sent to T-Rex for change alerts
     if (!o.skipWorld && now() - worldT >= worldEvery) { worldT = now();
-      try { const wp = join(dir, "c", "_world.json"); let prevW = null; try { prevW = JSON.parse(readFileSync(wp, "utf8")); } catch (e) {}
+      try { const wp = join(dir, "c", "_world.json"); let prevW = null; try { prevW = await openText(readFileSync(wp, "utf8")); } catch (e) {}
         const wr = await doWorld({ server, key, fetch: F, log, now: now(), ...(prevW ? { prev: prevW } : {}) });
-        if (wr && wr.snap) { writeFileSync(wp, JSON.stringify(wr.snap)); dirty++; } } catch (e) { log("World watch: skipped this time — " + String(e.message || e).slice(0, 80)); } }
+        if (wr && wr.snap) { writeFileSync(wp, await sealText(wr.snap)); dirty++; } } catch (e) { log("World watch: skipped this time — " + String(e.message || e).slice(0, 80)); } }
     publish(`company files: ${done} new results, ${filled} filled`);
     log(`Live company files: check ${loops} — ${want.size} new filings (${done} saved, list from ${nf.src}); background ${Math.min(st.cursor, list.length)} of ${list.length} companies.`);
     if (o.once) break;

@@ -10,6 +10,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { sealText, sealTree, sealOn } from "./seal.mjs";
 
 // the same key the app uses for its saved copies (offline-cache.js → ocKey): path + sorted query, cache-busters removed
 export function mirrorKey(url) {
@@ -46,7 +47,7 @@ export async function runMirror(o = {}) {
       const r = await F(server + path, { signal: AbortSignal.timeout(45000) }); if (!r.ok) { failed++; return null; }
       const j = await r.json(); if (!good(j)) return null;
       j._mirror = Date.now(); const p = join(dir, mirrorPath(mirrorKey(path)));
-      mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, JSON.stringify(j)); saved++; return j;
+      mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, await sealText(j)); saved++; return j;
     } catch (e) { failed++; return null; }
   };
   // 2) what to copy
@@ -64,8 +65,8 @@ export async function runMirror(o = {}) {
       const rows = j.rows || [];
       for (let p = 0; p * 100 < Math.max(1, rows.length) && p < 60; p++) {
         const page = { ok: true, qe: j.qe, view: j.view, sort: j.sort, dir: j.dir, page: p, size: 100, total: j.total, rows: rows.slice(p * 100, p * 100 + 100), _mirror: Date.now() };
-        const fp = join(dir, mirrorPath(mirrorKey("/api/db?" + new URLSearchParams({ ...base, page: String(p) })))); mkdirSync(join(fp, ".."), { recursive: true }); writeFileSync(fp, JSON.stringify(page)); saved++;
-        if (p === 0) { const fp0 = join(dir, mirrorPath(mirrorKey("/api/db?" + new URLSearchParams(base)))); mkdirSync(join(fp0, ".."), { recursive: true }); writeFileSync(fp0, JSON.stringify(page)); }   // the app may ask without page=0
+        const fp = join(dir, mirrorPath(mirrorKey("/api/db?" + new URLSearchParams({ ...base, page: String(p) })))); mkdirSync(join(fp, ".."), { recursive: true }); const pageTxt = await sealText(page); writeFileSync(fp, pageTxt); saved++;
+        if (p === 0) { const fp0 = join(dir, mirrorPath(mirrorKey("/api/db?" + new URLSearchParams(base)))); mkdirSync(join(fp0, ".."), { recursive: true }); writeFileSync(fp0, pageTxt); }   // the app may ask without page=0
       }
     } }
   // results list: latest + each of the last 7 days, and the result cards the list does not already carry
@@ -95,6 +96,8 @@ export async function runMirror(o = {}) {
   writeFileSync(join(dir, "README.md"), "Public market-data copy for T-Rex (results from companies' NSE filings). Generated automatically; replaced on every run. Contains no personal data.\n");
   const total = Object.keys(man.companies).length;
   log(`Mirror: ${saved} files saved (${nco} companies updated, ${total} of ${(lr.companies || []).length} companies in the GitHub copy)${failed ? `, ${failed} not available` : ""}.`);
+  // any older plain copies left from before sealing was switched on: sealed now (the manifest stays plain — times only)
+  if (sealOn()) { try { const n = await sealTree(join(dir, "m"), undefined, new Set(["manifest.json"])); if (n) log(`Mirror: ${n} older files sealed (encrypted).`); } catch (e) {} }
   // 3) one fresh commit replaces the branch (no history kept → the repository stays small)
   if (!o.skipGit) {
     try {

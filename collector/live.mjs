@@ -11,6 +11,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { runWorld } from "./world.mjs";
 
 export const LIVE_VERSION = 1;
 export const BRANCH = "co-data";
@@ -111,7 +112,8 @@ export async function runLive(o = {}) {
     return (all = st.list || []);
   }
   // 5) the loop: every 5 minutes in the day (07:30–24:00 IST), every 30 minutes at night
-  let loops = 0, built = 0, newOnes = 0, filled = 0;
+  let loops = 0, built = 0, newOnes = 0, filled = 0, worldT = 0;
+  const worldEvery = o.worldEvery ?? 30 * 60e3, doWorld = o.world || runWorld;
   while (now() < until - 60e3) {
     const tl = now(); loops++; const day = activeNow(tl) || o.always;
     // a) new filings
@@ -140,6 +142,11 @@ export async function runLive(o = {}) {
       for (const [sym] of again) { if (now() > until - 60e3) break; if (await build(sym, null)) { filled++; delete st.miss[sym]; } else st.miss[sym] = now(); stDirty = 1; }
       if (st.cursor >= list.length && now() - (st.full || 0) > 7 * 864e5) st.full = now();
     }
+    // c) World watch every 30 minutes: saved here (the app reads it from GitHub) and sent to T-Rex for change alerts
+    if (!o.skipWorld && now() - worldT >= worldEvery) { worldT = now();
+      try { const wp = join(dir, "c", "_world.json"); let prevW = null; try { prevW = JSON.parse(readFileSync(wp, "utf8")); } catch (e) {}
+        const wr = await doWorld({ server, key, fetch: F, log, now: now(), ...(prevW ? { prev: prevW } : {}) });
+        if (wr && wr.snap) { writeFileSync(wp, JSON.stringify(wr.snap)); dirty++; } } catch (e) { log("World watch: skipped this time — " + String(e.message || e).slice(0, 80)); } }
     publish(`company files: ${done} new results, ${filled} filled`);
     log(`Live company files: check ${loops} — ${want.size} new filings (${done} saved, list from ${nf.src}); background ${Math.min(st.cursor, list.length)} of ${list.length} companies.`);
     if (o.once) break;

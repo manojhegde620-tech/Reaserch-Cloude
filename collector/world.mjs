@@ -42,7 +42,39 @@ export const NEWS = [
   { id: "air", name: "Airspace & flights", q: '("airspace closed" OR "airspace closure" OR "flights suspended" OR "flights cancelled" OR "airspace reopened")' },
   { id: "conflict", name: "Conflict near India & the Gulf", q: '(Pakistan OR "Line of Control" OR "India China border" OR Iran OR Israel OR "Taiwan Strait") (military OR missile OR airstrike OR troops)' },
   { id: "oil", name: "Oil & gas supply", q: '("crude oil" OR OPEC OR LNG OR Brent) (supply OR disruption OR output OR sanctions)' },
+  { id: "rates", name: "Central banks & interest rates", q: '(RBI OR "Federal Reserve" OR "Fed" OR ECB) ("interest rate" OR "rate cut" OR "rate hike" OR "monetary policy")' },
+  { id: "indecon", name: "India economy", q: 'India (inflation OR GDP OR rupee OR "trade deficit" OR "fiscal deficit" OR FII)' },
+  { id: "mkts", name: "Global markets", q: '("stock market" OR "Wall Street" OR Sensex OR Nifty OR Nasdaq) (selloff OR crash OR plunge OR rally OR record)' },
 ];
+// global markets board (Yahoo Finance daily prices, one request each; 1-month line)
+export const MKTS = [
+  ["^NSEI", "Nifty 50", "India"], ["^BSESN", "Sensex", "India"], ["^INDIAVIX", "India VIX", "India"],
+  ["^GSPC", "S&P 500", "US"], ["^IXIC", "Nasdaq", "US"], ["^DJI", "Dow Jones", "US"], ["^VIX", "US VIX (fear gauge)", "US"],
+  ["^FTSE", "FTSE 100", "Europe"], ["^GDAXI", "DAX (Germany)", "Europe"],
+  ["^N225", "Nikkei (Japan)", "Asia"], ["^HSI", "Hang Seng", "Asia"], ["000001.SS", "Shanghai", "Asia"],
+  ["BZ=F", "Brent crude", "Commodities", "$"], ["CL=F", "WTI crude", "Commodities", "$"], ["NG=F", "Natural gas", "Commodities", "$"], ["GC=F", "Gold", "Commodities", "$"], ["SI=F", "Silver", "Commodities", "$"], ["HG=F", "Copper", "Commodities", "$"],
+  ["INR=X", "USD / INR", "Currency & rates", "₹"], ["DX-Y.NYB", "Dollar index", "Currency & rates"], ["^TNX", "US 10-year yield", "Currency & rates", "", "%"], ["BTC-USD", "Bitcoin", "Currency & rates", "$"],
+];
+export function marketFromChart(j) {             // Yahoo chart (1 month, daily) → price, day change, 1-month change, line
+  const r = j && j.chart && j.chart.result && j.chart.result[0]; if (!r) return null;
+  const m = r.meta || {}, c = ((r.indicators && r.indicators.quote && r.indicators.quote[0] && r.indicators.quote[0].close) || []).map((v, i) => [(r.timestamp || [])[i], v]).filter(x => x[0] && x[1] != null && isFinite(x[1]));
+  const price = m.regularMarketPrice != null ? m.regularMarketPrice : (c.length ? c[c.length - 1][1] : null); if (price == null) return null;
+  const lastDay = c.length ? new Date(c[c.length - 1][0] * 1000).toISOString().slice(0, 10) : null, priceDay = m.regularMarketTime ? new Date(m.regularMarketTime * 1000).toISOString().slice(0, 10) : lastDay;
+  const prevIdx = lastDay && priceDay && lastDay === priceDay ? c.length - 2 : c.length - 1;    // the close before today's price
+  const prev = prevIdx >= 0 ? c[prevIdx][1] : (m.chartPreviousClose ?? null), first = c.length ? c[0][1] : null;
+  const pc = (a, b) => a != null && b ? Math.round((a - b) / Math.abs(b) * 10000) / 100 : null;
+  return { price: Math.round(price * 100) / 100, prev: prev == null ? null : Math.round(prev * 100) / 100, chgPct: pc(price, prev), m1Pct: pc(price, first), at: m.regularMarketTime ? m.regularMarketTime * 1000 : null, line: c.map(x => Math.round(x[1] * 100) / 100).slice(-25) };
+}
+async function fetchMarkets(F, log) {
+  const out = []; let i = 0, fails = 0;
+  const one = async () => { while (i < MKTS.length) { const [sym, name, group, cur, unit] = MKTS[i++];
+    try { const r = await F(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1mo&interval=1d`, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36", "Accept": "application/json" }, signal: AbortSignal.timeout(20000) });
+      const x = r.ok ? marketFromChart(await r.json()) : null; if (x) out.push({ sym, name, group, cur: cur || "", unit: unit || "", ...x }); else fails++; } catch (e) { fails++; } } };
+  await Promise.all([one(), one(), one(), one()]);
+  out.sort((a, b) => MKTS.findIndex(m => m[0] === a.sym) - MKTS.findIndex(m => m[0] === b.sym));
+  if (log) log(`World watch: global markets — ${out.length} of ${MKTS.length} prices${fails ? ` (${fails} not available)` : ""}.`);
+  return out;
+}
 // GDACS: countries that matter for Indian companies (suppliers, buyers, routes)
 const KEY_CC = new Set(["IN", "CN", "TW", "JP", "KR", "ID", "MY", "VN", "TH", "BD", "LK", "PK", "NP", "MM", "AE", "SA", "IR", "OM", "QA", "KW", "IQ", "YE", "EG", "SG", "PH", "US"]);
 
@@ -177,7 +209,7 @@ export async function runWorld(o = {}) {
   if (!key) { log("World watch: TREX_KEY is not set."); return { ok: false }; }
   const get = async (url, ms = 30000) => { const r = await F(url, { headers: { "User-Agent": UA, "Accept": "*/*" }, signal: AbortSignal.timeout(ms) }); if (!r.ok) throw new Error("HTTP " + r.status); return r; };
   // the previous snapshot (history for "what is usual")
-  let prev = {}; try { const j = await (await get(`${server}/api/db?world=1&fresh=1`, 30000)).json(); if (j && j.ok && j.world) prev = j.world; } catch (e) {}
+  let prev = o.prev || {}; if (!o.prev) { try { const j = await (await get(`${server}/api/db?world=1&fresh=1`, 30000)).json(); if (j && j.ok && j.world) prev = j.world; } catch (e) {} }
   const snap = { v: 1, t: now, sea: prev.sea || null, disasters: prev.disasters || [], air: { regions: [], hist: {} }, mil: { regions: [], hist: {} }, news: { topics: [], hist: {} }, errors: [] };
 
   // 1) sea routes — PortWatch updates weekly, so once every 12 hours is plenty
@@ -240,6 +272,8 @@ export async function runWorld(o = {}) {
     snap.news.hist[t.id] = h;
     snap.news.topics.push({ id: t.id, name: t.name, n24: res ? res.n24 : null, usual: usual == null ? null : Math.round(usual), status: newsStatus(res ? res.n24 : null, usual, past.length), items: res ? res.items : ((prev.news && (prev.news.topics || []).find(x => x.id === t.id) || {}).items || []) });
   }
+  // 6) global markets (indices, oil, gold, rupee, yields, fear gauges)
+  if (!o.skipMarkets) { try { const items = await fetchMarkets(F, log); snap.markets = items.length ? { t: now, items } : (prev.markets || null); } catch (e) { snap.errors.push("markets: " + (e.message || e)); snap.markets = prev.markets || null; } }
   // send to T-Rex (one database write; T-Rex compares with the last snapshot and notifies on changes)
   if (o.dryRun) return { ok: true, snap };
   try {

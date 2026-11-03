@@ -44,7 +44,7 @@ export async function runMirror(o = {}) {
   let saved = 0, failed = 0;
   const save = async (path) => {                                  // fetch one T-Rex answer and store it under the app's key
     try {
-      const r = await F(server + path, { signal: AbortSignal.timeout(45000) }); if (!r.ok) { failed++; return null; }
+      const r = await F(server + path, { headers: key ? { "x-trex-key": key } : {}, signal: AbortSignal.timeout(45000) });   // the key: T-Rex is invite-only for browsers, and Node looks like one if (!r.ok) { failed++; return null; }
       const j = await r.json(); if (!good(j)) return null;
       j._mirror = Date.now(); const p = join(dir, mirrorPath(mirrorKey(path)));
       mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, await sealText(j)); saved++; return j;

@@ -201,7 +201,7 @@ export async function runDeep(o = {}) {
     if (!stopRun && ripeCount(co) && !o.skipPromises) {
       try {
         let quarters = [];
-        const j = await F(`${server}/api/db?symbol=${encodeURIComponent(sym)}`, { signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null);
+        const j = await F(`${server}/api/db?symbol=${encodeURIComponent(sym)}`, { headers: { "x-trex-key": key }, signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null);
         if (j && j.ok) { const qs = j.quarters || []; const basis = qs.some(q => q.basis === "C") ? "C" : "S"; const mine = qs.filter(q => q.basis === basis);
           const by = Object.fromEntries(mine.map(q => [q.qe, q])); const ly = qe => { const [y, m] = qe.split("-"); return `${+y - 1}-${m}-${qe.slice(8)}`; };
           const g = (a, b) => a != null && b ? Math.round((a - b) / Math.abs(b) * 1000) / 10 : null;
@@ -218,7 +218,7 @@ export async function runDeep(o = {}) {
   async function tidyCo(sym, co) {
     if (stopRun || o.skipTidy) return;
     let extra = [];
-    if (watchSet.has(sym)) { const j = await F(`${server}/api/db?insights=${encodeURIComponent(sym)}`, { signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null); if (j && j.ok) extra = j.facts || []; }
+    if (watchSet.has(sym)) { const j = await F(`${server}/api/db?insights=${encodeURIComponent(sym)}`, { headers: { "x-trex-key": key }, signal: AbortSignal.timeout(30000) }).then(r => r.json()).catch(() => null); if (j && j.ok) extra = j.facts || []; }
     try { const n = await tidyCompany(sym, co, extra, (sys, pr) => askClaude(F, ckey, sys, pr, null, st)); co.tdt = Date.now(); co.tv = TIDY_VERSION; return n; }
     catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; } return 0; }
   }

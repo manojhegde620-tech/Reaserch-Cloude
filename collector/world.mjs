@@ -209,7 +209,7 @@ export async function runWorld(o = {}) {
   if (!key) { log("World watch: TREX_KEY is not set."); return { ok: false }; }
   const get = async (url, ms = 30000) => { const r = await F(url, { headers: { "User-Agent": UA, "Accept": "*/*" }, signal: AbortSignal.timeout(ms) }); if (!r.ok) throw new Error("HTTP " + r.status); return r; };
   // the previous snapshot (history for "what is usual")
-  let prev = o.prev || {}; if (!o.prev) { try { const j = await (await get(`${server}/api/db?world=1&fresh=1`, 30000)).json(); if (j && j.ok && j.world) prev = j.world; } catch (e) {} }
+  let prev = o.prev || {}; if (!o.prev) { try { const j = await (await F(`${server}/api/db?world=1&fresh=1`, { headers: key ? { "x-trex-key": key } : {}, signal: AbortSignal.timeout(30000) })).json(); if (j && j.ok && j.world) prev = j.world; } catch (e) {} }
   const snap = { v: 1, t: now, sea: prev.sea || null, disasters: prev.disasters || [], air: { regions: [], hist: {} }, mil: { regions: [], hist: {} }, news: { topics: [], hist: {} }, errors: [] };
 
   // 1) sea routes — PortWatch updates weekly, so once every 12 hours is plenty

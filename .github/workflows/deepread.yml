@@ -29,6 +29,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
           TREX_KEY: ${{ secrets.TREX_KEY }}
+          DATA_KEY: ${{ secrets.DATA_KEY }}      # optional: when set, the files on GitHub are stored encrypted
           GITHUB_TOKEN: ${{ github.token }}
           TREX_DEEP_MINUTES: "45"
           TREX_DEEP_PARALLEL: "6"         # companies read at the same time

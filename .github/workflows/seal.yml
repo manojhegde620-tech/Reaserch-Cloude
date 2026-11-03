@@ -1,0 +1,27 @@
+# T-Rex: seal (encrypt) the AI deep-reading files on GitHub once DATA_KEY is set, and replace the branch with one commit
+# so the plain copies are no longer in its history. Safe to run any time; does nothing when everything is sealed already.
+# (The company files, World watch and the market-data copy are sealed by their own jobs.)
+name: T-Rex seal data on GitHub
+on:
+  schedule:
+    - cron: "41 2 * * *"        # once a day (UTC)
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: trex-deep             # never at the same time as the deep reading (same branch)
+  cancel-in-progress: false
+jobs:
+  seal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Seal the deep-reading files
+        run: node collector/seal.mjs deep-data
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}

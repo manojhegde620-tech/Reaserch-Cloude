@@ -25,6 +25,7 @@ jobs:
         run: node collector/live.mjs
         env:
           TREX_KEY: ${{ secrets.TREX_KEY }}
+          DATA_KEY: ${{ secrets.DATA_KEY }}      # optional: when set, the files on GitHub are stored encrypted
           GITHUB_TOKEN: ${{ github.token }}
           TREX_LIVE_MINUTES: "335"
       - name: Start the next run

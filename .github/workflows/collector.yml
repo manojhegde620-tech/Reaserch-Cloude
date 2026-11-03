@@ -43,5 +43,6 @@ jobs:
         run: node collector/mirror.mjs
         env:
           TREX_KEY: ${{ secrets.TREX_KEY }}
+          DATA_KEY: ${{ secrets.DATA_KEY }}      # optional: when set, the files on GitHub are stored encrypted
           GITHUB_TOKEN: ${{ github.token }}
           TREX_MIRROR_MINUTES: "12"

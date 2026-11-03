@@ -1,0 +1,16 @@
+# One-off check: can GitHub's servers read BSE's results data? (prints only HTTP status codes)
+name: BSE reachability check
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check BSE
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          for u in "https://api.bseindia.com/BseIndiaAPI/api/PeerSmartSearch/w?Type=SS&text=RELIANCE" "https://api.bseindia.com/BseIndiaAPI/api/Integratedfinancedata/w?scripcode=500325" "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=20261103&strScrip=&strSearch=P&strToDate=20261103&strType=C&subcategory=-1" "https://www.bseindia.com/XBRLFILES/IFIndasDuplicateUploadDocument/Integrated_Finance_Ind_As_500325_30102026093302_IFIndAs.html"; do
+            code=$(curl -s -o /tmp/out -w "%{http_code}" -A "$UA" -H "Referer: https://www.bseindia.com/" -H "Origin: https://www.bseindia.com" -H "Accept: application/json, text/plain, */*" --max-time 30 "$u")
+            echo "$code $(wc -c < /tmp/out) bytes  ${u%%\?*}"
+          done

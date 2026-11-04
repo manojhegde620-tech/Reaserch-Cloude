@@ -1,4 +1,5 @@
-# T-Rex company logos: from Wikidata (open data) — matched only by the exact NSE ticker, never guessed.
+# T-Rex company logos: from each company's own website (as registered with BSE) and Wikidata (open data) —
+# matched only by exact identifiers (NSE symbol / ISIN), never guessed.
 # Saves small images in the "logo-data" branch; the app shows them instead of the coloured initials.
 name: T-Rex company logos
 on:

@@ -4,18 +4,21 @@
 name: T-Rex collector
 on:
   schedule:
-    - cron: "23 */2 * * *"      # every 2 hours (UTC). GitHub sometimes skips scheduled runs, so they are frequent and short
+    - cron: "23 */2 * * *"      # every 2 hours (UTC) — a backup start: GitHub often starts scheduled runs hours late, so each run also starts the next one
   workflow_dispatch:            # "Run workflow" button for a manual run
 permissions:
   contents: write      # only to publish the public market-data copy to the gh-pages branch of this repository
+  actions: write       # to start the next run 2 hours after this one started
 concurrency:
   group: trex-collector
   cancel-in-progress: false
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 140
     steps:
+      - name: Note the start time
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -46,3 +49,10 @@ jobs:
           DATA_KEY: ${{ secrets.DATA_KEY }}      # optional: when set, the files on GitHub are stored encrypted
           GITHUB_TOKEN: ${{ github.token }}
           TREX_MIRROR_MINUTES: "12"
+      - name: Start the next run 2 hours after this one started (GitHub's own timer is unreliable)
+        if: always()
+        run: |
+          w=$(( 7200 - ( $(date +%s) - T0 ) )); if [ "$w" -gt 0 ]; then echo "Waiting $((w/60)) minutes"; sleep "$w"; fi
+          gh workflow run collector.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."
+        env:
+          GH_TOKEN: ${{ github.token }}

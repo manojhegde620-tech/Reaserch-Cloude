@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: 22
       - name: Install PDF text tool
-        run: sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext   # retried: GitHub's package mirror sometimes fails
       - name: Read company documents with Claude
         run: node collector/deepread.mjs
         env:
@@ -37,6 +37,6 @@ jobs:
           TREX_PUBLIC_LOG: "1"
       - name: Start the next run if companies remain
         if: always()
-        run: if [ -f /tmp/trex-deep-more ]; then if [ -f /tmp/trex-deep-wait ]; then echo "Nothing got done this run (NSE or Claude busy) - waiting 15 minutes."; sleep 900; fi; gh workflow run deepread.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Nothing more to read right now."; fi
+        run: if [ "${{ job.status }}" != "success" ]; then echo "This run failed (GitHub trouble?) - trying again in 15 minutes."; sleep 900; touch /tmp/trex-deep-more; fi; if [ -f /tmp/trex-deep-more ]; then if [ -f /tmp/trex-deep-wait ]; then echo "Nothing got done this run (NSE or Claude busy) - waiting 15 minutes."; sleep 900; fi; for i in 1 2 3 4 5; do gh workflow run deepread.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."; else echo "Nothing more to read right now."; fi
         env:
           GH_TOKEN: ${{ github.token }}

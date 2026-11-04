@@ -16,14 +16,14 @@ concurrency:
 jobs:
   events:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Install PDF text tool
-        run: sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext   # retried: GitHub's package mirror sometimes fails
       - name: Read important announcements
         run: node collector/events.mjs
         env:
@@ -37,6 +37,6 @@ jobs:
           TREX_EVENTS_BACK_DAYS: "730"     # fill two years of history (once), then only new filings
       - name: Start the next run if older days remain
         if: always()
-        run: if [ -f /tmp/trex-events-more ]; then if [ -f /tmp/trex-events-wait ]; then echo "No day finished this run (NSE busy) - waiting 15 minutes."; sleep 900; fi; gh workflow run events.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Up to date."; fi
+        run: if [ "${{ job.status }}" != "success" ]; then echo "This run failed (GitHub trouble?) - trying again in 15 minutes."; sleep 900; touch /tmp/trex-events-more; fi; if [ -f /tmp/trex-events-more ]; then if [ -f /tmp/trex-events-wait ]; then echo "No day finished this run (NSE busy) - waiting 15 minutes."; sleep 900; fi; for i in 1 2 3 4 5; do gh workflow run events.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."; else echo "Up to date."; fi
         env:
           GH_TOKEN: ${{ github.token }}

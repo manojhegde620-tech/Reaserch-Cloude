@@ -30,6 +30,6 @@ jobs:
           TREX_LIVE_MINUTES: "335"
       - name: Start the next run
         if: always()
-        run: if [ -f /tmp/trex-live-more ]; then gh workflow run live.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Not restarting."; fi
+        run: if [ -f /tmp/trex-live-more ]; then for i in 1 2 3 4 5; do gh workflow run live.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."; else echo "Not restarting."; fi
         env:
           GH_TOKEN: ${{ github.token }}

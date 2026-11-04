@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: 22
       - name: Install PDF text tool (for reading company presentations)
-        run: sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext   # retried: GitHub's package mirror sometimes fails
       - name: World watch (trade routes, disasters, air traffic, news — public data, no AI)
         run: node collector/world.mjs
         timeout-minutes: 6
@@ -53,6 +53,6 @@ jobs:
         if: always()
         run: |
           w=$(( 7200 - ( $(date +%s) - T0 ) )); if [ "$w" -gt 0 ]; then echo "Waiting $((w/60)) minutes"; sleep "$w"; fi
-          gh workflow run collector.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."
+          for i in 1 2 3 4 5; do gh workflow run collector.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."
         env:
           GH_TOKEN: ${{ github.token }}

@@ -11,7 +11,7 @@ const LIST = p => `https://www.nseindia.com/api/integrated-filing-results?type=I
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 export async function run(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY;
   const F = o.fetch || globalThis.fetch;
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));

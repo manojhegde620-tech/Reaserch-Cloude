@@ -209,7 +209,7 @@ export function buildEvent(row, ans, pagesText, co, fx) {
 
 // ---------- the run ----------
 export async function runEvents(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY, ckey = o.claudeKey ?? process.env.ANTHROPIC_API_KEY, F = o.fetch || globalThis.fetch;
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));
   const now = o.now || Date.now(), until = Date.now() + (o.maxMinutes || +process.env.TREX_EVENTS_MINUTES || 40) * 60e3;

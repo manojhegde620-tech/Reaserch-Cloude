@@ -23,7 +23,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const istDates = n => { const out = []; const now = Date.now() + 5.5 * 3600e3; for (let i = 0; i < n; i++) { const d = new Date(now - i * 864e5); out.push(`${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`); } return out; };
 
 export async function runMirror(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY, F = o.fetch || globalThis.fetch;
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));
   const dir = o.dir || "site", until = Date.now() + (o.maxMinutes || +process.env.TREX_MIRROR_MINUTES || 10) * 60e3;

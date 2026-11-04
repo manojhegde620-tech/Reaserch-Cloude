@@ -77,7 +77,7 @@ export function pageIcons(html, base) {
 }
 
 export async function runLogos(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY, F = o.fetch || globalThis.fetch;
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));
   const dir = o.dir || "logodata", now = o.now || Date.now();

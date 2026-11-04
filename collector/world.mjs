@@ -9,7 +9,7 @@
 // Run: node collector/world.mjs   (needs TREX_KEY)
 import { pathToFileURL } from "node:url";
 
-const UA = "Mozilla/5.0 (compatible; T-Rex/2.0; +https://t-rex-cloude.manojhegde620.workers.dev)";
+const UA = "Mozilla/5.0 (compatible; market-data-reader/2.0)";
 const DAY = 864e5;
 const iso = t => new Date(t).toISOString().slice(0, 10);
 const median = a => { const s = a.filter(x => x != null && isFinite(x)).sort((x, y) => x - y); const n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; };
@@ -203,7 +203,7 @@ const keepHist = (h, now, days = 9) => (h || []).filter(([t]) => t > now - days 
 
 /* ---------- the run ---------- */
 export async function runWorld(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY, F = o.fetch || globalThis.fetch, now = o.now || Date.now();
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));
   if (!key) { log("World watch: TREX_KEY is not set."); return { ok: false }; }

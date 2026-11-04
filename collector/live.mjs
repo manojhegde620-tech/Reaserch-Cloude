@@ -32,7 +32,7 @@ export function hasQe(file, qe, basis) {
 }
 
 export async function runLive(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY, F = o.fetch || globalThis.fetch;
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));
   const now = o.now || (() => Date.now());

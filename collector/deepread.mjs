@@ -270,11 +270,17 @@ export async function runDeep(o = {}) {
   await publish(`deep reading: ${Object.keys(ix.companies).length} companies`);
   const total = tg.symbols.length, have = Object.keys(ix.companies).length;
   log(`Deep reading: ${cos} companies, ${docs} documents, ${facts} checked facts this run · ${have} of ${total} companies done · Claude cost so far ≈ $${ix.spent.toFixed(2)} (this run ≈ $${claudeCost(st).toFixed(2)}).`);
-  // more to read and this run made progress → tell the workflow to start the next run straight away (no waiting for the clock)
-  if (!o.skipGit && !ix.keyDead && ix.spent < cap && (Object.values(ix.companies).filter(c => c.v >= DEEP_VERSION && c.t).length < total || tidyLeft > 0)) {
+  // more to read → tell the workflow to start the next run straight away (no waiting for the clock). Companies never tried
+  // count always; companies left half-done (a document to retry) and the tidy-up count only while this run made progress on
+  // them — otherwise the hourly timer retries them, instead of a run every 15 minutes that changes nothing.
+  const unread = tg.symbols.filter(s => !ix.companies[s]).length;
+  const halfDone = tg.symbols.filter(s => { const c = ix.companies[s]; return c && !(c.v >= DEEP_VERSION && c.t); }).length;
+  if (!o.skipGit && !ix.keyDead && ix.spent < cap && deepMore({ unread, halfDone, docs, tidyLeft, tidyDone })) {
     // GitHub's hourly timer is unreliable for this repository, so each run starts the next one; a run that got nothing done
     // (NSE refusing, Claude busy) asks the workflow to wait 15 minutes first
     try { writeFileSync(join(tmpdir(), "trex-deep-more"), "1"); if (docs === 0 && !tidyDone) writeFileSync(join(tmpdir(), "trex-deep-wait"), "1"); } catch (e) {} }
   return { ok: true, companies: cos, docs, facts, spent: ix.spent, have, total };
 }
+// start the next run at once? — yes while companies were never tried, or while this run made progress on half-done ones / the tidy-up
+export function deepMore(x) { return x.unread > 0 || (x.halfDone > 0 && x.docs > 0) || (x.tidyLeft > 0 && x.tidyDone > 0); }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) runDeep().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(0); });

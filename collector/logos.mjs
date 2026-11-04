@@ -216,6 +216,9 @@ export async function runLogos(o = {}) {
   if (timeUp) log("Logos: time is up for this run — the rest next time.");
   const dropped1 = dropGeneric(); if (dropped1) { added = Math.max(0, added - dropped1); log(`Logos: ${dropped1} placeholder icons removed (not real company logos).`); }
   ix.t = now; ix.v = 1; writeFileSync(ixPath, JSON.stringify(ix));
+  // the small list the app downloads: symbol → file (index.json also keeps the collector's own notes)
+  const appPath = join(dir, "l", "app.json"); if (!existsSync(appPath)) changed = true;
+  writeFileSync(appPath, JSON.stringify({ t: now, logos: Object.fromEntries(Object.entries(ix.logos).map(([k, v]) => [k, v.f + "?v=" + (v.t || 0)])) }));
   const total = Object.keys(ix.logos).length;
   log(`Logos: ${added} new logos this run (${tried} companies tried) · ${total} companies have a logo in total.`);
   if (!o.skipGit && (added || changed || !existsSync(join(dir, ".git", "refs", "heads", BRANCH)))) {

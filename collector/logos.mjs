@@ -1,5 +1,6 @@
 // T-Rex COMPANY LOGOS — runs on GitHub Actions (free), never on Cloudflare.
 // Sources, each matched ONLY by an exact identifier (never by guessing a name), so a wrong logo is not possible by design:
+//   0) logopack/*.tar — the owner's own collection, one SYMBOL.webp per NSE symbol (first choice)
 //   a) collector/sites.json — each company's own website as the company itself registered it with BSE
 //      (BSE "Company information": NSE symbol → BSE code → ISIN → website). Refreshed by hand now and then.
 //   b) Wikidata, the open database behind Wikipedia: the NSE listing with its ticker, or the ISIN (from a),
@@ -10,9 +11,10 @@
 // Companies without either keep the coloured initials in the app. Logos are public, so these files are not sealed.
 // Run: node collector/logos.mjs   (needs TREX_KEY, GITHUB_TOKEN, GITHUB_REPOSITORY — set by the workflow)
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 export const BRANCH = "logo-data";
@@ -140,6 +142,25 @@ export async function runLogos(o = {}) {
   }
   // generic placeholder icons (WordPress "W", web-host defaults, Google's grey globe) are not the company's logo:
   // their fingerprints are kept in ix.bad and refused from then on
+  // the logo pack (logopack/*.tar in this repository: SYMBOL.webp, 96 px, collected by the owner) — first choice for every
+  // company it covers; read again only when the pack files change
+  try {
+    const packDir = o.packDir || fileURLToPath(new URL("../logopack/", import.meta.url));
+    const tars = existsSync(packDir) ? readdirSync(packDir).filter(f => /\.tar$/i.test(f)).sort() : [];
+    const sig = tars.map(f => f + ":" + statSync(join(packDir, f)).size).join("|");
+    if (tars.length && ix.pack !== sig) {
+      const tmp = join(tmpdir(), "trex-pack-" + Date.now()); mkdirSync(tmp, { recursive: true }); let n = 0;
+      for (const t of tars) execFileSync("tar", ["-xf", join(packDir, t), "-C", tmp], { stdio: ["ignore", "pipe", "pipe"] });
+      for (const f of readdirSync(tmp)) {
+        const m = f.match(/^([A-Z0-9&\-]{1,20})\.(webp|png|jpg)$/i); if (!m) continue;
+        const b = readFileSync(join(tmp, f)); const type = imgType(b); if (!type || type === "svg" || b.length > MAXB || b.length < 100) continue;
+        const s = m[1].toUpperCase(), nf = `${s}.${type}`, old = ix.logos[s];
+        if (old && old.f !== nf) rmSync(join(dir, "l", old.f), { force: true });
+        writeFileSync(join(dir, "l", nf), b); ix.logos[s] = { f: nf, src: "pack", t: now, h: hashOf(b) }; n++;
+      }
+      rmSync(tmp, { recursive: true, force: true }); ix.pack = sig; changed = true; log(`Logos: ${n} logos taken from the logo pack.`);
+    }
+  } catch (e) { log("Logos: logo pack skipped — " + String(e.message || e).slice(0, 80)); }
   ix.bad = ix.bad || {};
   const siteOf = s => (ix.logos[s] && ix.logos[s].d) || domainOf((info[s] && info[s].web[0]) || (sites[s] && cleanSite(sites[s].web)) || "");
   try { const r = await get("https://www.google.com/s2/favicons?domain=no-such-site.invalid&sz=128", 12000); const b = new Uint8Array(await r.arrayBuffer()); if (b.length) ix.bad[hashOf(b)] = "google-default"; } catch (e) {}

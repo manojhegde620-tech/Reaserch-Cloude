@@ -1,0 +1,42 @@
+# T-Rex important announcements: every NSE filing is sorted by simple rules (free); only possible big events
+# (orders, capacity, new / exited businesses, deals, fund raising, buybacks, rating changes, auditor / CFO / MD exits,
+# legal action) are read by Claude Haiku. Numbers are kept only when found on the filing's page; events are kept only
+# when they matter for a company of that size. Saved in the "event-data" branch (sealed). First runs fill 2 years back.
+name: T-Rex important announcements
+on:
+  schedule:
+    - cron: "41 */2 * * *"      # every 2 hours (UTC)
+  workflow_dispatch:
+permissions:
+  contents: write      # to save the results in the event-data branch
+  actions: write       # to start the next run straight away while older days remain
+concurrency:
+  group: trex-events
+  cancel-in-progress: false
+jobs:
+  events:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PDF text tool
+        run: sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+      - name: Read important announcements
+        run: node collector/events.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TREX_EVENTS_MINUTES: "40"
+          TREX_EVENTS_PARALLEL: "6"
+          TREX_EVENTS_BUDGET_USD: "40"     # at most this much Claude credit per calendar month for announcements
+          TREX_EVENTS_BACK_DAYS: "730"     # fill two years of history (once), then only new filings
+      - name: Start the next run if older days remain
+        if: always()
+        run: if [ -f /tmp/trex-events-more ]; then if [ -f /tmp/trex-events-wait ]; then echo "No day finished this run (NSE busy) - waiting 15 minutes."; sleep 900; fi; gh workflow run events.yml --ref main --repo "$GITHUB_REPOSITORY" && echo "Next run started."; else echo "Up to date."; fi
+        env:
+          GH_TOKEN: ${{ github.token }}

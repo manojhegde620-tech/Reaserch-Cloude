@@ -9,7 +9,7 @@
 // Saved per company in the "event-data" branch: e/SYM.json (sealed when DATA_KEY is set) + e/index.json (progress).
 // Run: node collector/events.mjs   (needs ANTHROPIC_API_KEY, TREX_KEY, GITHUB_TOKEN, GITHUB_REPOSITORY — set by the workflow)
 import { execFileSync, execFile } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,7 +17,7 @@ import { pdfTextPoppler, askClaude, claudeCost } from "./insights.mjs";
 import { sealText, openText, sealOn } from "./seal.mjs";
 
 export const BRANCH = "event-data";
-export const EV_VERSION = 1;
+export const EV_VERSION = 2;                 // v2: amount types, routine rules, one card per event
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const REF = "https://www.nseindia.com/companies-listing/corporate-filings-announcements";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -73,14 +73,23 @@ export function toCrore(value, unit, currency = "INR", fx = {}) {
   const mult = { million: 1e6, mn: 1e6, billion: 1e9, bn: 1e9, thousand: 1e3, k: 1e3 }[u] ?? (u ? null : 1); if (mult == null) return null;
   return v * mult * rate / 1e7;
 }
-// the number Claude gave must appear in its quote (commas, "Rs." and spacing ignored)
-export function numberInQuote(value, quote) {
-  const nums = (String(quote || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/g) || []).map(Number); const v = +value;
-  return nums.some(n => Math.abs(n - v) <= Math.max(0.005, Math.abs(v) * 0.001));
+// the number Claude gave must appear in its quote (commas, "Rs." and spacing ignored) — also when the filing writes the
+// same amount in another unit (e.g. "Rs 23,89,50,000" for 23.895 crore)
+export function numberInQuote(value, quote, unit = "") {
+  const nums = (String(quote || "").replace(/(\d),(?=\d)/g, "$1").match(/\d+(?:\.\d+)?/g) || []).map(Number); const v = +value; if (!isFinite(v) || v <= 0) return false;
+  const u = String(unit || "").toLowerCase();
+  const asRupees = /crore|cr/.test(u) ? v * 1e7 : /lakh|lac/.test(u) ? v * 1e5 : /million|mn/.test(u) ? v * 1e6 : /billion|bn/.test(u) ? v * 1e9 : v;
+  const forms = [v, asRupees, asRupees / 1e5, asRupees / 1e6, asRupees / 1e7, asRupees / 1e9];
+  return nums.some(n => forms.some(f => Math.abs(n - f) <= Math.max(0.005, Math.abs(f) * 0.001)));
 }
 
 // ---------- 3) size against the company, decide if it matters ----------
 const WARN = new Set(["auditor_exit", "key_person_exit", "legal", "insolvency", "offer_for_sale"]);
+// which kind of amount may size which kind of event (anything else — a rated loan facility, a "sales potential", a
+// disputed income figure — is kept out of the size, so it can never look bigger than it is)
+const AMOUNT_OK = { order: ["order_value"], capacity: ["capex"], acquisition: ["deal_value"], merger: ["deal_value"], demerger: ["deal_value"], joint_venture: ["deal_value"],
+  strategic_investment: ["deal_value"], exit_business: ["deal_value"], new_business: ["capex", "deal_value"], buyback: ["buyback_size"], fund_raise: ["issue_size"],
+  legal: ["tax_demand", "penalty", "claim", "default", "relief"], offer_for_sale: ["issue_size", "deal_value"], insolvency: ["default", "claim"] };
 export function sizeOf(ev, co) {
   const out = {}; if (ev.amt == null) return out;
   if (co && co.rev > 0) out.rev = Math.round(ev.amt / co.rev * 1000) / 10;          // % of last 4 quarters' revenue
@@ -94,38 +103,51 @@ export function material(ev) {
     case "capacity": return s.rev != null ? s.rev >= 3 : true;
     case "new_business": case "exit_business": case "merger": case "demerger": return s.mcap != null ? s.mcap >= 1 : true;
     case "acquisition": case "joint_venture": case "strategic_investment": return s.mcap != null ? s.mcap >= 3 : false;
-    case "fund_raise": return s.mcap != null ? s.mcap >= 3 : false;
-    case "buyback": case "auditor_exit": case "insolvency": case "offer_for_sale": return true;
+    case "fund_raise": return /equity|warrant|convertible/.test(ev.ins || "") && (s.mcap != null ? s.mcap >= 3 : false);
+    case "buyback": case "auditor_exit": case "offer_for_sale": return true;
+    case "insolvency": return true;                                                     // only the big steps reach here (see the prompt)
     case "rating": return !!(ev.r && /upgrade|downgrade/.test(ev.r.dir || ""));
     case "key_person_exit": return /\b(cfo|ceo|md|managing director|chief (financial|executive)|whole[- ]?time)\b/i.test((ev.p && ev.p.role) || "");
-    case "legal": return (s.mcap != null && s.mcap >= 1) || (s.rev != null && s.rev >= 2);
+    case "legal": return ev.at === "default" || (s.mcap != null && s.mcap >= 1) || (s.rev != null && s.rev >= 2);
     case "licence": return true;
     default: return false;
   }
 }
 const cpKey = s => String(s || "").toLowerCase().replace(/\b(limited|ltd|private|pvt|inc|llc|corporation|corp|company|co|the|and|of)\b/g, "").replace(/[^a-z0-9]+/g, "");
-const LIFE = new Set(["acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "exit_business", "new_business", "fund_raise", "buyback"]);
-// add an event to a company's list: a repeat of the same order is marked, the next step of the same deal joins its first card
+const LIFE = new Set(["acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "exit_business", "new_business", "fund_raise", "buyback", "offer_for_sale", "insolvency"]);
+const near = (a, b, days) => Math.abs(Date.parse(a) - Date.parse(b)) <= days * 864e5;
+const sameAmt = (a, b) => a == null || b == null ? a == null && b == null : Math.abs(a - b) <= Math.max(1, Math.max(a, b) * 0.01);
+// add an event to a company's list: one event = one card. The same thing filed twice is marked as a repeat; the next
+// step of the same deal / buyback / fund raise joins its first card; several commissionings close together share one card.
 export function addEvent(list, ev) {
-  const day = Date.parse(ev.d), cp = cpKey(ev.cp);
   if (list.some(x => x.id === ev.id)) return "seen";
-  if (ev.k === "order" && ev.amt != null) {
-    const rep = list.find(x => x.k === "order" && x.amt != null && Math.abs(x.amt - ev.amt) <= Math.max(1, ev.amt * 0.01) && Math.abs(Date.parse(x.d) - day) < 120 * 864e5 && (!cp || !cpKey(x.cp) || cpKey(x.cp) === cp));
-    if (rep) { rep.rep = (rep.rep || []).concat({ d: ev.d, u: ev.u }).slice(-5); return "repeat"; }
+  const cp = cpKey(ev.cp);
+  const step = (first, how) => { first.steps = (first.steps || []).concat({ d: ev.d, st: ev.st || "", u: ev.u, t: ev.t }).sort((a, b) => a.d < b.d ? -1 : 1).slice(-8);
+    if (ev.d >= first.d && ev.st) first.st = ev.st; if (first.amt == null && ev.amt != null) { first.amt = ev.amt; first.q = ev.q; first.size = ev.size; } return how; };
+  // the same order / rating / exit / anything filed again within 3 weeks (same amount, same other party)
+  const rep = list.find(x => x.k === ev.k && near(x.d, ev.d, ev.k === "order" ? 120 : 21) && sameAmt(x.amt, ev.amt) && (!cp || !cpKey(x.cp) || cpKey(x.cp) === cp)
+    && (ev.k !== "rating" || !x.r || !ev.r || cpKey(x.r.a) === cpKey(ev.r.a)) && (ev.k !== "key_person_exit" || cpKey(x.p && x.p.role) === cpKey(ev.p && ev.p.role)));
+  if (rep && !LIFE.has(ev.k)) { rep.rep = (rep.rep || []).concat({ d: ev.d, u: ev.u }).slice(-5); return "repeat"; }
+  if (LIFE.has(ev.k)) {
+    const first = list.find(x => x.k === ev.k && ((cp && cpKey(x.cp) === cp && near(x.d, ev.d, 400)) || (near(x.d, ev.d, 45) && (!cp || !cpKey(x.cp)) && (sameAmt(x.amt, ev.amt) || x.amt == null || ev.amt == null))));
+    if (first) return step(first, "step");
   }
-  if (LIFE.has(ev.k) && cp) {
-    const first = list.find(x => x.k === ev.k && cpKey(x.cp) === cp && Math.abs(Date.parse(x.d) - day) < 400 * 864e5);
-    if (first) { first.steps = (first.steps || []).concat({ d: ev.d, st: ev.st || "", u: ev.u, t: ev.t }).sort((a, b) => a.d < b.d ? -1 : 1).slice(-8);
-      if (ev.d >= first.d && ev.st) first.st = ev.st; if (first.amt == null && ev.amt != null) { first.amt = ev.amt; first.q = ev.q; first.size = ev.size; } return "step"; }
-  }
+  if (ev.k === "capacity") { const first = list.find(x => x.k === "capacity" && near(x.d, ev.d, 45)); if (first) return step(first, "step"); }
   list.push(ev); list.sort((a, b) => a.d < b.d ? 1 : -1); return "new";
 }
 
 // ---------- the Claude prompt ----------
 export const EV_SYSTEM = `You read ONE stock-exchange filing of an Indian listed company and report the event in it as JSON only (no other text).
 Rules: facts only, in plain English. Never give an opinion, a verdict or advice. Never use words like "major", "big", "strong", "huge", "positive", "negative", "boost".
-Every number you give must be copied from the filing, and "quote" must be the exact words of the filing (one sentence or phrase) that contain that number.
-If the filing is routine or minor (e.g. incorporating a small subsidiary, an intimation, a clarification, a reaffirmed rating, a small investment, an ESOP allotment, a meeting notice), set "routine": true.`;
+Every number you give must be copied from the filing, and "quote" must be the exact words of the filing (one sentence or phrase) that contain that number. Never calculate an amount yourself.
+Set "routine": true for anything an investor would not need to know, for example:
+- incorporating a small subsidiary, a clarification, an intimation of a meeting, newspaper copies, an ESOP allotment, a reaffirmed or newly assigned rating;
+- borrowing or debt raised by issuing NCDs, bonds or commercial paper (only equity, warrants or convertibles are a fund raise that matters);
+- a merger of wholly owned subsidiaries into the company, and procedural steps of any scheme (hearing dates, meeting orders, no-objection letters, filings);
+- insolvency process updates (committee of creditors meetings, extensions, lists of creditors, cost approvals) — only the start of insolvency, a resolution plan approved, a liquidation order or the process ending are not routine;
+- a CFO / CEO / MD being re-designated or replaced in a planned way with no departure, a company secretary or independent director change;
+- routine registrations and certificates (RERA project registration, FSSAI / FDA facility registration, ISO); a licence is not routine only when it lets the company start a new business or product, or when it is a regulator's inspection outcome or warning;
+- anything the company itself says has no material impact.`;
 export function evPrompt(row, kindHint, pages) {
   return `Company: ${row.sm_name || row.symbol} (NSE: ${row.symbol})
 Filing subject: ${row.desc || ""}
@@ -142,29 +164,39 @@ Reply with JSON only:
 {"kind": "order|capacity|new_business|exit_business|acquisition|merger|demerger|joint_venture|strategic_investment|fund_raise|buyback|rating|auditor_exit|key_person_exit|legal|insolvency|offer_for_sale|licence|other",
  "routine": true|false,
  "title": "what happened, max 14 words, e.g. 'Order of Rs 2,090 crore for a water supply project'",
+ "title_no_amount": "the same title without any money amount, e.g. 'Order for a water supply project'",
  "detail": "one more short factual line or empty",
- "amount": {"value": number, "unit": "crore|lakh|million|billion|rupees", "currency": "INR|USD|EUR|GBP|...", "quote": "exact words from the filing with this number"} or null,
+ "amount": {"value": number, "unit": "crore|lakh|million|billion|rupees", "currency": "INR|USD|EUR|GBP|...", "type": "order_value|capex|deal_value|buyback_size|issue_size|tax_demand|penalty|claim|default|relief|other", "quote": "exact words from the filing with this number"} or null,
+ "instrument": "equity|warrants|convertible|debt|" (for fund_raise),
  "counterparty": "the other party (client, target company, partner, buyer) or empty",
  "months": number of months to execute / complete, or null,
  "status": "announced|approved|completed|lowest_bidder|letter_of_intent|signed|",
  "rating": {"agency": "", "from": "", "to": "", "dir": "upgrade|downgrade|reaffirmed|new|withdrawn"} or null,
  "person": {"role": "", "reason": ""} or null}
+The amount must be the value of the event itself (the order, the deal price, the buyback size, the issue size, the capex, the tax demand or penalty) — never a sales potential, revenue potential, project value estimate, a bank facility that was rated, or a disputed income figure (use null then).
 For several orders in one filing give the TOTAL only if the filing states the total; otherwise the largest one.`;
 }
 export function parseEv(text) { try { const s = String(text || ""); const a = s.indexOf("{"), b = s.lastIndexOf("}"); return a >= 0 && b > a ? JSON.parse(s.slice(a, b + 1)) : null; } catch (e) { return null; } }
 const KINDS = new Set(["order", "capacity", "new_business", "exit_business", "acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "fund_raise", "buyback", "rating", "auditor_exit", "key_person_exit", "legal", "insolvency", "offer_for_sale", "licence", "other"]);
 const BANNED = /\b(major|big|huge|strong|massive|positive|negative|boost|bullish|bearish|robust|significant)\b/gi;
 const clean = (s, n) => String(s || "").replace(BANNED, "").replace(/\s{2,}/g, " ").replace(/\s+([,.])/g, "$1").trim().slice(0, n);
+const MONEY = /(rs\.?|inr|₹|usd|us\$|\$|€|eur|£|gbp)\s*[\d,.]+\s*(crores?|cr\.?|lakhs?|lacs?|million|mn|billion|bn)?/i;
 // Claude's answer + the filing text → a checked event (or null)
 export function buildEvent(row, ans, pagesText, co, fx) {
   const a = ans || {}; const k = KINDS.has(a.kind) ? a.kind : "other";
   const ev = { id: String(row.seq_id || row.attchmntFile || ""), d: nseDay(row.an_dt || row.sort_date), k, t: clean(a.title, 120), x: clean(a.detail, 160), u: String(row.attchmntFile || ""), routine: !!a.routine };
   if (!ev.t || !ev.d) return null;
-  if (a.amount && a.amount.quote && quoteOnPage(a.amount.quote, pagesText) && numberInQuote(a.amount.value, a.amount.quote)) {
-    const cr = toCrore(a.amount.value, a.amount.unit, a.amount.currency, fx);
-    if (cr != null && cr < 5e6) { ev.amt = Math.round(cr * 100) / 100; ev.q = String(a.amount.quote).slice(0, 240); if (String(a.amount.currency || "INR").toUpperCase() !== "INR") ev.cur = String(a.amount.currency).toUpperCase(); }
+  const am = a.amount, typeOk = am && (AMOUNT_OK[k] || []).includes(String(am.type || "").toLowerCase());
+  if (typeOk && am.quote && quoteOnPage(am.quote, pagesText) && numberInQuote(am.value, am.quote, am.unit)) {
+    const cr = toCrore(am.value, am.unit, am.currency, fx);
+    if (cr != null && cr < 5e6) { ev.amt = Math.round(cr * 100) / 100; ev.q = String(am.quote).slice(0, 240); ev.at = String(am.type).toLowerCase(); if (String(am.currency || "INR").toUpperCase() !== "INR") ev.cur = String(am.currency).toUpperCase(); }
   }
-  if (a.amount && ev.amt == null) ev.t = ev.t.replace(/(rs\.?|inr|₹|usd|us\$|\$|€|eur)\s*[\d,.]+\s*(crore|cr|lakh|lacs?|million|mn|billion|bn)?/gi, "").replace(/\bof\s+for\b/i, "for").replace(/\s{2,}/g, " ").trim();   // an amount we could not confirm is not shown
+  if (ev.amt == null && MONEY.test(ev.t)) {                                         // an amount we could not confirm is not shown
+    const alt = clean(a.title_no_amount, 120); ev.t = alt && !MONEY.test(alt) ? alt : "";
+    if (!ev.t) return null;
+  }
+  if (MONEY.test(ev.x) && ev.amt == null) ev.x = "";
+  if (a.instrument) ev.ins = String(a.instrument).toLowerCase().replace(/[^a-z]/g, "").slice(0, 12);
   if (a.counterparty) ev.cp = clean(a.counterparty, 80);
   if (a.months != null && isFinite(+a.months) && +a.months > 0 && +a.months < 240) ev.m = Math.round(+a.months);
   if (a.status) ev.st = String(a.status).replace(/[^a-z_]/gi, "").slice(0, 20);
@@ -199,10 +231,14 @@ export async function runEvents(o = {}) {
   const ixPath = join(dir, "e", "index.json");
   let ix = { v: EV_VERSION, days: {}, seen: {}, month: "", monthSpent: 0, spent: 0, n: 0 };
   try { if (existsSync(ixPath)) ix = { ...ix, ...JSON.parse(readFileSync(ixPath, "utf8")) }; } catch (e) {}
+  if (ix.v !== EV_VERSION) {                               // better rules: read everything again once with them
+    for (const f of readdirSync(join(dir, "e"))) if (f !== "index.json") rmSync(join(dir, "e", f), { force: true });
+    ix = { ...ix, v: EV_VERSION, days: {}, seen: {}, n: 0, _reset: 1 }; log(`Events: rules version ${EV_VERSION} — starting again from the newest day.`);
+  }
   const month = isoDay(now).slice(0, 7); if (ix.month !== month) { ix.month = month; ix.monthSpent = 0; }
   if (ix.monthSpent >= monthCap) { log(`Events: this month's budget of $${monthCap} is used — waiting for next month.`); return { ok: true, capped: true }; }
   const st = {}; const spentNow = () => claudeCost(st);
-  let dirty = false;
+  let dirty = !!ix._reset; delete ix._reset;
   const saveCo = async (sym, c) => { c.t = Date.now(); writeFileSync(join(dir, "e", sym + ".json"), await sealText(c)); dirty = true; };
   const loadCo = async sym => { try { const x = await openText(readFileSync(join(dir, "e", sym + ".json"), "utf8")); if (x) return x; } catch (e) {} return { symbol: sym, v: EV_VERSION, events: [] }; };
   const publish = async msg => {

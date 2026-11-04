@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
 
 export const BRANCH = "logo-data";
 const UA = "T-Rex-logo-collector/1.0 (+https://github.com/manojhegde620-tech/Reaserch-Cloude)";
@@ -40,6 +41,12 @@ export function imgSide(buf, type) {
   if (type === "gif" && b.length > 10) return Math.max(b[6] | b[7] << 8, b[8] | b[9] << 8);
   if (type === "ico" && b.length > 6) { const n = b[4] | b[5] << 8; let m = 0; for (let i = 0; i < n && 6 + 16 * i + 1 < b.length; i++) m = Math.max(m, b[6 + 16 * i] || 256, b[7 + 16 * i] || 256); return m; }
   return null;
+}
+export const hashOf = b => createHash("sha1").update(b).digest("hex").slice(0, 20);
+// two websites of one business family ("adani.com" / "adanigreenenergy.com"): same first 4+ letters of the main name
+export function sameFamily(a, b) {
+  const core = d => String(d || "").toLowerCase().replace(/^www\./, "").split(".").filter(x => !/^(com|co|in|net|org|ltd|biz|bank|ai|tech|group|global|one|info)$/.test(x)).sort((x, y) => y.length - x.length)[0] || "";
+  const x = core(a), y = core(b); if (!x || !y) return false; let i = 0; while (i < x.length && x[i] === y[i]) i++; return i >= 4 || x.includes(y) || y.includes(x);
 }
 export const domainOf = u => { try { const x = new URL(/^https?:/i.test(u) ? u : "https://" + u); return x.hostname.replace(/^www\./, "").toLowerCase(); } catch (e) { return ""; } };
 // image type from the first bytes (never trust the server's word for it)
@@ -127,19 +134,35 @@ export async function runLogos(o = {}) {
   // 3) fetch the image for each matched company that has none yet (or whose last try was > 30 days ago)
   let changed = false;
   if (ix.sv !== 2) {                                       // the website list is new: give every company a fresh try once,
-    ix.tried = {}; ix.sv = 2; changed = true;                             // and drop earlier icons too small to look sharp (< 32 px)
+    ix.tried = {}; ix.sv = 2; changed = true;              // and drop earlier icons too small to look sharp (< 32 px)
     for (const [s, v] of Object.entries(ix.logos)) { try { const p = join(dir, "l", v.f), b = readFileSync(p); const side = imgSide(b, imgType(b));
       if (side != null && side < 32) { delete ix.logos[s]; rmSync(p, { force: true }); } } catch (e) { delete ix.logos[s]; } }
   }
-  const save = (sym, buf, type, src) => { if (!type || buf.length > MAXB || buf.length < 100) return false;
+  // generic placeholder icons (WordPress "W", web-host defaults, Google's grey globe) are not the company's logo:
+  // their fingerprints are kept in ix.bad and refused from then on
+  ix.bad = ix.bad || {};
+  const siteOf = s => (ix.logos[s] && ix.logos[s].d) || domainOf((info[s] && info[s].web[0]) || (sites[s] && cleanSite(sites[s].web)) || "");
+  try { const r = await get("https://www.google.com/s2/favicons?domain=no-such-site.invalid&sz=128", 12000); const b = new Uint8Array(await r.arrayBuffer()); if (b.length) ix.bad[hashOf(b)] = "google-default"; } catch (e) {}
+  const dropGeneric = () => {                              // the same picture for companies of different groups = a placeholder
+    const g = {}; let n = 0;
+    for (const [s, v] of Object.entries(ix.logos)) { if (v.src !== "site") continue; try { const h = v.h || (v.h = hashOf(readFileSync(join(dir, "l", v.f)))); (g[h] = g[h] || []).push(s); } catch (e) {} }
+    for (const [h, list] of Object.entries(g)) {
+      const fam = list.map(siteOf); const one = list.length > 1 && fam.every(d => sameFamily(d, fam[0]));
+      if (!ix.bad[h] && (list.length < 2 || one)) continue;
+      ix.bad[h] = ix.bad[h] || "shared"; for (const s of list) { rmSync(join(dir, "l", ix.logos[s].f), { force: true }); delete ix.logos[s]; delete ix.tried[s]; n++; }
+    }
+    if (n) changed = true; return n;
+  };
+  const dropped0 = dropGeneric(); if (dropped0) log(`Logos: ${dropped0} placeholder icons removed (not real company logos).`);
+  const save = (sym, buf, type, src, d) => { if (!type || buf.length > MAXB || buf.length < 100) return false;
     if (src === "site" && type === "svg") return false;      // site SVGs can carry scripts / odd sizes — keep to bitmaps
     const side = imgSide(buf, type); if (side != null && side < 32) return false;   // a 16-px favicon would look blurred
-    const f = `${sym}.${type}`; writeFileSync(join(dir, "l", f), buf); ix.logos[sym] = { f, src, t: now }; return true; };
+    const h = hashOf(buf); if (ix.bad[h]) return false;      // a known placeholder
+    const f = `${sym}.${type}`; writeFileSync(join(dir, "l", f), buf); ix.logos[sym] = { f, src, t: now, h, ...(d ? { d } : {}) }; return true; };
   const fetchBuf = async (url, ms) => { const r = await get(url, ms); if (!r.ok) return null; const b = new Uint8Array(await r.arrayBuffer()); return b; };
   let added = 0, tried = 0; const todo = Object.keys(info).filter(s => !ix.logos[s] && (!ix.tried[s] || now - ix.tried[s] > 30 * 864e5)).slice(0, o.max || 3000);
   const until = now + (o.budgetMs || 40 * 60e3);           // stop in time to save; the rest is picked up next run
-  for (const sym of todo) {
-    if (!o.now && Date.now() > until) { log("Logos: time is up for this run — the rest next time."); break; }
+  const one = async sym => {
     tried++; ix.tried[sym] = now; const c = info[sym]; let ok = false;
     for (const lf of c.logo.slice(0, 2)) {                 // Commons file → PNG thumbnail 128 px wide
       if (ok) break; const name = decodeURIComponent(String(lf).split("/").pop() || ""); if (!name) continue;
@@ -151,11 +174,16 @@ export async function runLogos(o = {}) {
       try { const r = await get(w, 15000, { Accept: "text/html" }); const html = r.ok ? (await r.text()).slice(0, 300000) : ""; icons = pageIcons(html, r.url || w); } catch (e) {}
       for (const u of [...icons.map(x => x.url).slice(0, 6), `https://${d}/apple-touch-icon.png`, `https://www.${d}/apple-touch-icon.png`, `https://${d}/favicon.ico`, `https://www.${d}/favicon.ico`,
                        `https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=128`]) {   // last: Google's copy of the same site's icon
-        try { const b = await fetchBuf(u, 12000); if (b && save(sym, b, imgType(b), "site")) { ok = true; break; } } catch (e) {} }
+        try { const b = await fetchBuf(u, 12000); if (b && save(sym, b, imgType(b), "site", d)) { ok = true; break; } } catch (e) {} }
     }
     if (ok) added++;
     if (o.gap) await new Promise(r => setTimeout(r, o.gap));
-  }
+  };
+  let next = 0, timeUp = false;                            // 6 companies at a time (different websites, so no site is hurried)
+  const worker = async () => { while (next < todo.length) { if (!o.now && Date.now() > until) { timeUp = true; break; } await one(todo[next++]); } };
+  await Promise.all(Array.from({ length: o.parallel || 6 }, worker));
+  if (timeUp) log("Logos: time is up for this run — the rest next time.");
+  const dropped1 = dropGeneric(); if (dropped1) { added = Math.max(0, added - dropped1); log(`Logos: ${dropped1} placeholder icons removed (not real company logos).`); }
   ix.t = now; ix.v = 1; writeFileSync(ixPath, JSON.stringify(ix));
   const total = Object.keys(ix.logos).length;
   log(`Logos: ${added} new logos this run (${tried} companies tried) · ${total} companies have a logo in total.`);

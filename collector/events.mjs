@@ -266,6 +266,9 @@ export async function runEvents(o = {}) {
       }
     } catch (e) {}
     log(`Events: company sizes known for ${Object.keys(sizes).length} companies.`);
+    // without company sizes an order can't be judged big or small for that company → read nothing this time (the next run
+    // tries again); never mark a day as done with the wrong yardstick
+    if (Object.keys(sizes).length < 200) { log("Events: company sizes could not be read from T-Rex — stopping; the next run tries again."); return { ok: false, noSizes: true }; }
   }
   // exchange rates for orders in other currencies (₹ per unit)
   let fx = o.fx || null;

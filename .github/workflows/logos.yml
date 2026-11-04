@@ -1,0 +1,26 @@
+# T-Rex company logos: from Wikidata (open data) — matched only by the exact NSE ticker, never guessed.
+# Saves small images in the "logo-data" branch; the app shows them instead of the coloured initials.
+name: T-Rex company logos
+on:
+  schedule:
+    - cron: "23 3 * * 0"        # once a week (Sunday, UTC)
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: trex-logos
+  cancel-in-progress: false
+jobs:
+  logos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Collect company logos
+        run: node collector/logos.mjs
+        env:
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}

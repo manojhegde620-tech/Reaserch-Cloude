@@ -147,7 +147,8 @@ export async function runLogos(o = {}) {
   try {
     const packDir = o.packDir || fileURLToPath(new URL("../logopack/", import.meta.url));
     const tars = existsSync(packDir) ? readdirSync(packDir).filter(f => /\.tar$/i.test(f)).sort() : [];
-    const sig = tars.map(f => f + ":" + statSync(join(packDir, f)).size).join("|");
+    const bsePath = join(packDir, "bse.json");
+    const sig = tars.map(f => f + ":" + statSync(join(packDir, f)).size).join("|") + (existsSync(bsePath) ? "|bse:" + statSync(bsePath).size : "");
     if (tars.length && ix.pack !== sig) {
       const tmp = join(tmpdir(), "trex-pack-" + Date.now()); mkdirSync(tmp, { recursive: true }); let n = 0;
       for (const t of tars) execFileSync("tar", ["-xf", join(packDir, t), "-C", tmp], { stdio: ["ignore", "pipe", "pipe"] });
@@ -158,7 +159,16 @@ export async function runLogos(o = {}) {
         if (old && old.f !== nf) rmSync(join(dir, "l", old.f), { force: true });
         writeFileSync(join(dir, "l", nf), b); ix.logos[s] = { f: nf, src: "pack", t: now, h: hashOf(b) }; n++;
       }
-      rmSync(tmp, { recursive: true, force: true }); ix.pack = sig; changed = true; log(`Logos: ${n} logos taken from the logo pack.`);
+      // BSE: the scrip code (how T-Rex names BSE listings, e.g. 500002.BO) → the same company's logo. "same" = the NSE
+      // symbol of the same company (logo already in the NSE pack); "bseOnly" = files CODE.webp in the bse tars.
+      let nb = 0;
+      try { const bm = existsSync(bsePath) ? JSON.parse(readFileSync(bsePath, "utf8")) : null;
+        for (const [code, sym] of Object.entries((bm && bm.same) || {})) { if (!/^\d{6}$/.test(code)) continue; const t = ix.logos[String(sym).toUpperCase()]; if (t && t.src === "pack") { ix.logos[code] = { f: t.f, src: "pack", t: now, h: t.h, alias: String(sym).toUpperCase() }; nb++; } }
+        for (const [code, sym] of Object.entries((bm && bm.bseOnly) || {})) { const t = ix.logos[code]; const S = String(sym).toUpperCase();
+          if (t && sites && sites[S] && !ix.logos[S]) ix.logos[S] = { ...t, alias: code };    // the NSE symbol too, only when BSE's own list ties it to this company
+          if (t) nb++; }
+      } catch (e) {}
+      rmSync(tmp, { recursive: true, force: true }); ix.pack = sig; changed = true; log(`Logos: ${n} logos taken from the logo pack (${nb} BSE codes covered).`);
     }
   } catch (e) { log("Logos: logo pack skipped — " + String(e.message || e).slice(0, 80)); }
   ix.bad = ix.bad || {};

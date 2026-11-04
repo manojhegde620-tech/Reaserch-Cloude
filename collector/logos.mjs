@@ -1,7 +1,8 @@
 // T-Rex COMPANY LOGOS — runs on GitHub Actions (free), never on Cloudflare.
 // Source: Wikidata, the open database behind Wikipedia. For each company it records the exchange listing with its
-// ticker, its official website and (often) its logo file. A company is matched ONLY by its exact NSE ticker on
-// Wikidata — never by guessing a name or a web address — so a wrong logo is not possible by design.
+// ticker and/or the company's ISIN, its official website and (often) its logo file. A company is matched ONLY by an
+// exact identifier — its NSE ticker, or its ISIN from NSE's own list of equities (EQUITY_L.csv) — never by guessing
+// a name or a web address, so a wrong logo is not possible by design.
 //   1) logo file on Wikimedia Commons (P154) → a 128-px PNG thumbnail
 //   2) otherwise the official website (P856) → the site's own app icon / favicon (largest one the site offers)
 // Saved in the "logo-data" branch: l/SYMBOL.png (or .ico/.svg), l/index.json. One commit replaces the branch.
@@ -17,6 +18,14 @@ const UA = "T-Rex-logo-collector/1.0 (+https://github.com/manojhegde620-tech/Rea
 const WDQ = "https://query.wikidata.org/sparql";
 const MAXB = 90 * 1024;                                   // a logo bigger than this is skipped
 export const normTicker = t => String(t || "").toUpperCase().replace(/^(NSE|NSEI|NSE\s*INDIA)\s*[:\-]\s*/, "").replace(/\.NS$/, "").trim();
+// NSE's list of equities (SYMBOL, NAME OF COMPANY, SERIES, DATE OF LISTING, PAID UP VALUE, MARKET LOT, ISIN NUMBER, FACE VALUE) → ISIN → symbol
+export function isinMap(csv) {
+  const lines = String(csv || "").split(/\r?\n/).filter(Boolean); if (!lines.length) return {};
+  const head = lines[0].split(",").map(h => h.trim().toUpperCase()); const si = head.indexOf("SYMBOL"), ii = head.findIndex(h => h.startsWith("ISIN"));
+  if (si < 0 || ii < 0) return {}; const out = {};
+  for (const l of lines.slice(1)) { const c = l.split(","); const sym = (c[si] || "").trim().toUpperCase(), isin = (c[ii] || "").trim().toUpperCase(); if (/^IN[A-Z0-9]{10}$/.test(isin) && sym) out[isin] = sym; }
+  return out;
+}
 export const domainOf = u => { try { const x = new URL(/^https?:/i.test(u) ? u : "https://" + u); return x.hostname.replace(/^www\./, "").toLowerCase(); } catch (e) { return ""; } };
 // image type from the first bytes (never trust the server's word for it)
 export function imgType(buf) {
@@ -76,6 +85,20 @@ export async function runLogos(o = {}) {
   catch (e) { log("Logos: Wikidata did not answer — " + String(e.message || e).slice(0, 80)); return { ok: false }; }
   const info = {}; for (const b of rows) { const t = normTicker(b.ticker && b.ticker.value); if (!t || !want.has(t)) continue; const c = info[t] = info[t] || { web: [], logo: [] };
     if (b.web && !c.web.includes(b.web.value)) c.web.push(b.web.value); if (b.logo && !c.logo.includes(b.logo.value)) c.logo.push(b.logo.value); }
+  // 2b) the same by ISIN: NSE's own list gives each symbol's ISIN; Wikidata items carry the ISIN (P946)
+  let byIsin = 0;
+  try {
+    const csv = await get("https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv", 45000, { Accept: "text/csv,*/*" }).then(r => r.ok ? r.text() : "");
+    const im = isinMap(csv); const nIsin = Object.keys(im).length;
+    if (nIsin) {
+      const q2 = `SELECT ?isin ?web ?logo WHERE { ?item wdt:P946 ?isin . FILTER(STRSTARTS(?isin, "INE")) OPTIONAL { ?item wdt:P856 ?web } OPTIONAL { ?item wdt:P154 ?logo } }`;
+      const r2 = await get(`${WDQ}?format=json&query=${encodeURIComponent(q2)}`, 90000, { Accept: "application/sparql-results+json" }); const j2 = await r2.json();
+      for (const b of (j2.results && j2.results.bindings) || []) { const t = im[String(b.isin && b.isin.value || "").toUpperCase()]; if (!t || !want.has(t)) continue;
+        if (!info[t]) byIsin++; const c = info[t] = info[t] || { web: [], logo: [] };
+        if (b.web && !c.web.includes(b.web.value)) c.web.push(b.web.value); if (b.logo && !c.logo.includes(b.logo.value)) c.logo.push(b.logo.value); }
+    }
+    log(`Logos: NSE's list has ${nIsin} ISINs; ${byIsin} more companies matched on Wikidata by ISIN.`);
+  } catch (e) { log("Logos: ISIN match skipped this time — " + String(e.message || e).slice(0, 80)); }
   log(`Logos: Wikidata lists ${rows.length} NSE listings; ${Object.keys(info).length} of ${want.size} T-Rex companies matched by ticker (${Object.values(info).filter(c => c.logo.length).length} with a logo file, ${Object.values(info).filter(c => c.web.length).length} with a website).`);
   // 3) fetch the image for each matched company that has none yet (or whose last try was > 30 days ago)
   const save = (sym, buf, type, src) => { if (!type || buf.length > MAXB || buf.length < 100) return false; const f = `${sym}.${type}`; writeFileSync(join(dir, "l", f), buf); ix.logos[sym] = { f, src, t: now }; return true; };

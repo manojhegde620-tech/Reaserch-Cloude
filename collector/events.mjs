@@ -40,6 +40,7 @@ const RULES = [
   ["person", /resignation of director\/kmp|resignation$|change in management/i, /\b(cfo|chief financial|ceo|chief executive|managing director|whole[- ]?time director)\b/i],
   ["legal", /action\(s\) (taken|initiated)|orders? passed|pendency of litigation|penalt|insolvency|default/i, null],
   ["ofs", /offer for sale/i, null],
+  ["takeover", /open offer|public announcement.{0,40}(sast|takeover)|letter of offer.{0,30}(sast|takeover)/i, null],
   ["licence", /key licen[cs]es|regulatory approvals/i, null],
 ];
 // general subjects ("Updates", "Press Release", "Outcome of Board Meeting" …) only with these words in NSE's one-line text
@@ -51,6 +52,7 @@ const WORDS = [
   ["newbiz", /foray|diversif|new (business|segment|vertical)|enter(s|ed|ing)? (into )?(the )?[a-z ]{0,30}(business|market|segment|sector)|discontinu|closure of (the )?(plant|unit|business|division)|shut ?down|exit(s|ed|ing)? (from )?(the )?[a-z ]{0,30}business/i, null],
   ["fund", /\bqip\b|qualified institutional|preferential (issue|allotment)|rights issue|fund rais/i, null],
   ["buyback", /buy ?back/i, null],
+  ["debt", /prepa(id|yment|y)\b.{0,40}(loan|debt|borrowing|term|ncd|debenture)|(loan|debt|borrowings?).{0,30}(fully )?(re|pre)paid|debt[- ]free|zero (net )?debt|deleverag|reduc(ed|tion|ing) (in |of |its )?(total |gross |net )?(debt|borrowings)/i, null],
 ];
 export function candidate(row) {
   const subj = String(row.desc || "").replace(/\s+/g, " ").trim(), text = String(row.attchmntText || "").replace(/\s+/g, " ").trim(), both = subj + " " + text;
@@ -89,7 +91,7 @@ const WARN = new Set(["auditor_exit", "key_person_exit", "legal", "insolvency", 
 // disputed income figure — is kept out of the size, so it can never look bigger than it is)
 const AMOUNT_OK = { order: ["order_value"], capacity: ["capex"], acquisition: ["deal_value"], merger: ["deal_value"], demerger: ["deal_value"], joint_venture: ["deal_value"],
   strategic_investment: ["deal_value"], exit_business: ["deal_value"], new_business: ["capex", "deal_value"], buyback: ["buyback_size"], fund_raise: ["issue_size"],
-  legal: ["tax_demand", "penalty", "claim", "default", "relief"], offer_for_sale: ["issue_size", "deal_value"], insolvency: ["default", "claim"] };
+  legal: ["tax_demand", "penalty", "claim", "default", "relief"], offer_for_sale: ["issue_size", "deal_value"], insolvency: ["default", "claim"], takeover: ["deal_value"], debt_reduction: ["debt_repaid"] };
 export function sizeOf(ev, co) {
   const out = {}; if (ev.amt == null) return out;
   if (co && co.rev > 0) out.rev = Math.round(ev.amt / co.rev * 1000) / 10;          // % of last 4 quarters' revenue
@@ -110,11 +112,13 @@ export function material(ev) {
     case "key_person_exit": return /\b(cfo|ceo|md|managing director|chief (financial|executive)|whole[- ]?time)\b/i.test((ev.p && ev.p.role) || "");
     case "legal": return ev.at === "default" || (s.mcap != null && s.mcap >= 1) || (s.rev != null && s.rev >= 2);
     case "licence": return true;
+    case "takeover": return true;                                                       // an open offer / change of control always matters
+    case "debt_reduction": return s.rev != null ? s.rev >= 3 : s.mcap != null ? s.mcap >= 1 : ev.amt != null && ev.amt >= 100;
     default: return false;
   }
 }
 const cpKey = s => String(s || "").toLowerCase().replace(/\b(limited|ltd|private|pvt|inc|llc|corporation|corp|company|co|the|and|of)\b/g, "").replace(/[^a-z0-9]+/g, "");
-const LIFE = new Set(["acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "exit_business", "new_business", "fund_raise", "buyback", "offer_for_sale", "insolvency"]);
+const LIFE = new Set(["takeover", "acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "exit_business", "new_business", "fund_raise", "buyback", "offer_for_sale", "insolvency"]);
 const near = (a, b, days) => Math.abs(Date.parse(a) - Date.parse(b)) <= days * 864e5;
 const sameAmt = (a, b) => a == null || b == null ? a == null && b == null : Math.abs(a - b) <= Math.max(1, Math.max(a, b) * 0.01);
 // add an event to a company's list: one event = one card. The same thing filed twice is marked as a repeat; the next
@@ -147,7 +151,9 @@ Set "routine": true for anything an investor would not need to know, for example
 - insolvency process updates (committee of creditors meetings, extensions, lists of creditors, cost approvals) — only the start of insolvency, a resolution plan approved, a liquidation order or the process ending are not routine;
 - a CFO / CEO / MD being re-designated or replaced in a planned way with no departure, a company secretary or independent director change;
 - routine registrations and certificates (RERA project registration, FSSAI / FDA facility registration, ISO); a licence is not routine only when it lets the company start a new business or product, or when it is a regulator's inspection outcome or warning;
-- anything the company itself says has no material impact.`;
+- anything the company itself says has no material impact.
+Repaying or prepaying a loan / debentures ahead of schedule, cutting total debt or becoming debt-free is "debt_reduction" (not routine) — routine only when it is a scheduled instalment.
+An open offer to the public shareholders (SEBI takeover rules) or an acquirer taking control of the company is "takeover".`;
 export function evPrompt(row, kindHint, pages) {
   return `Company: ${row.sm_name || row.symbol} (NSE: ${row.symbol})
 Filing subject: ${row.desc || ""}
@@ -161,12 +167,12 @@ ${pages.slice(0, 14000)}
 """
 
 Reply with JSON only:
-{"kind": "order|capacity|new_business|exit_business|acquisition|merger|demerger|joint_venture|strategic_investment|fund_raise|buyback|rating|auditor_exit|key_person_exit|legal|insolvency|offer_for_sale|licence|other",
+{"kind": "order|capacity|new_business|exit_business|acquisition|merger|demerger|joint_venture|strategic_investment|takeover|debt_reduction|fund_raise|buyback|rating|auditor_exit|key_person_exit|legal|insolvency|offer_for_sale|licence|other",
  "routine": true|false,
  "title": "what happened, max 14 words, e.g. 'Order of Rs 2,090 crore for a water supply project'",
  "title_no_amount": "the same title without any money amount, e.g. 'Order for a water supply project'",
  "detail": "one more short factual line or empty",
- "amount": {"value": number, "unit": "crore|lakh|million|billion|rupees", "currency": "INR|USD|EUR|GBP|...", "type": "order_value|capex|deal_value|buyback_size|issue_size|tax_demand|penalty|claim|default|relief|other", "quote": "exact words from the filing with this number"} or null,
+ "amount": {"value": number, "unit": "crore|lakh|million|billion|rupees", "currency": "INR|USD|EUR|GBP|...", "type": "order_value|capex|deal_value|buyback_size|issue_size|debt_repaid|tax_demand|penalty|claim|default|relief|other", "quote": "exact words from the filing with this number"} or null,
  "instrument": "equity|warrants|convertible|debt|" (for fund_raise),
  "counterparty": "the other party (client, target company, partner, buyer) or empty",
  "months": number of months to execute / complete, or null,
@@ -177,7 +183,7 @@ The amount must be the value of the event itself (the order, the deal price, the
 For several orders in one filing give the TOTAL only if the filing states the total; otherwise the largest one.`;
 }
 export function parseEv(text) { try { const s = String(text || ""); const a = s.indexOf("{"), b = s.lastIndexOf("}"); return a >= 0 && b > a ? JSON.parse(s.slice(a, b + 1)) : null; } catch (e) { return null; } }
-const KINDS = new Set(["order", "capacity", "new_business", "exit_business", "acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "fund_raise", "buyback", "rating", "auditor_exit", "key_person_exit", "legal", "insolvency", "offer_for_sale", "licence", "other"]);
+const KINDS = new Set(["order", "capacity", "new_business", "exit_business", "acquisition", "merger", "demerger", "joint_venture", "strategic_investment", "takeover", "debt_reduction", "fund_raise", "buyback", "rating", "auditor_exit", "key_person_exit", "legal", "insolvency", "offer_for_sale", "licence", "other"]);
 const BANNED = /\b(major|big|huge|strong|massive|positive|negative|boost|bullish|bearish|robust|significant)\b/gi;
 const clean = (s, n) => String(s || "").replace(BANNED, "").replace(/\s{2,}/g, " ").replace(/\s+([,.])/g, "$1").trim().slice(0, n);
 const MONEY = /(rs\.?|inr|₹|usd|us\$|\$|€|eur|£|gbp)\s*[\d,.]+\s*(crores?|cr\.?|lakhs?|lacs?|million|mn|billion|bn)?/i;
@@ -207,6 +213,14 @@ export function buildEvent(row, ans, pagesText, co, fx) {
   return ev;
 }
 
+// ---------- the Announcements tab: every kept event also goes to T-Rex's own database (whole market in one list) ----------
+export const ANN_V = 1;                      // bump → the whole history is sent again once
+export function annRow(sym, e) {
+  const j = {}; if (e.r) j.r = e.r; if (e.p) j.p = e.p; if (e.m) j.m = e.m; if (e.cur) j.cur = e.cur; if (e.ins) j.ins = e.ins;
+  if (e.steps && e.steps.length) j.steps = e.steps.map(x => ({ d: x.d, st: x.st || "" })).slice(-8); if (e.rep && e.rep.length) j.rep = e.rep.length;
+  const sz = e.size || {};
+  return { id: String(e.id), s: sym, d: e.d, k: e.k, t: e.t || "", x: e.x || "", u: e.u || "", amt: e.amt ?? null, rev: sz.rev ?? null, mc: sz.mcap ?? null, w: e.w ? 1 : 0, st: e.st || "", cp: e.cp || "", j };
+}
 // ---------- the run ----------
 export async function runEvents(o = {}) {
   const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
@@ -239,7 +253,8 @@ export async function runEvents(o = {}) {
   if (ix.monthSpent >= monthCap) { log(`Events: this month's budget of $${monthCap} is used — waiting for next month.`); return { ok: true, capped: true }; }
   const st = {}; const spentNow = () => claudeCost(st);
   let dirty = !!ix._reset; delete ix._reset;
-  const saveCo = async (sym, c) => { c.t = Date.now(); writeFileSync(join(dir, "e", sym + ".json"), await sealText(c)); dirty = true; };
+  const changed = new Set();
+  const saveCo = async (sym, c) => { c.t = Date.now(); writeFileSync(join(dir, "e", sym + ".json"), await sealText(c)); dirty = true; changed.add(sym); };
   const loadCo = async sym => { try { const x = await openText(readFileSync(join(dir, "e", sym + ".json"), "utf8")); if (x) return x; } catch (e) {} return { symbol: sym, v: EV_VERSION, events: [] }; };
   const publish = async msg => {
     ix.t = Date.now(); writeFileSync(ixPath, JSON.stringify(ix));
@@ -323,6 +338,21 @@ export async function runEvents(o = {}) {
   }
   ix.monthSpent = +(ix.monthSpent + spentNow()).toFixed(4); ix.spent = +(ix.spent + spentNow()).toFixed(4); ix.n = (ix.n || 0) + nKept;
   const left = days.filter(d => !ix.days[d]).length;
+  // to T-Rex's database: the companies changed in this run; the first time the whole history; once a day every company's size
+  let annSent = 0;
+  if (!o.noAnn) {
+    const annPost = async (events, cos, backfill) => { try { const r = await F(`${server}/api/ann`, { method: "POST", headers: { "x-trex-key": key, "content-type": "application/json" }, body: JSON.stringify({ action: "put", events, cos, backfill }), signal: AbortSignal.timeout(90000) }); const j = await r.json(); return j && j.ok ? j : null; } catch (e) { return null; } };
+    const today = isoDay(now), full = ix.annV !== ANN_V, coDay = ix.annCo !== today;
+    const files = full || coDay ? readdirSync(join(dir, "e")).filter(f => f.endsWith(".json") && f !== "index.json").map(f => f.slice(0, -5)) : [];
+    const coOf = (sym, c) => ({ n: (c && c.name) || null, mcap: (sizes[sym] && sizes[sym].mcap) ?? null, rev: (sizes[sym] && sizes[sym].rev) ?? null });
+    let okAll = true, batch = [], bcos = {};
+    const flush = async () => { if (!batch.length && !Object.keys(bcos).length) return; const r = await annPost(batch, bcos, full); if (!r) okAll = false; else annSent += r.saved || 0; batch = []; bcos = {}; };
+    for (const sym of (full ? files : [...changed])) { const c = await loadCo(sym); for (const e of (c.events || [])) batch.push(annRow(sym, e)); bcos[sym] = coOf(sym, c); if (batch.length >= 300) await flush(); }
+    await flush();
+    if (coDay && !full) { for (const sym of files) { if (!bcos[sym]) bcos[sym] = coOf(sym, null); if (Object.keys(bcos).length >= 1000) await flush(); } await flush(); }
+    if (okAll) { if (full) ix.annV = ANN_V; if (full || coDay) ix.annCo = today; dirty = true; }
+    log(`Events: ${annSent} events sent to the Announcements tab${full ? " (whole history)" : ""}${okAll ? "" : " — some could not be sent, tried again next run"}.`);
+  }
   await publish(`events: ${nKept} kept`);
   log(`Events: ${nRows} filings looked at, ${nCand} possible events, ${nRead} read by AI, ${nKept} important ones kept · ${daysDone} days finished, ${left} to go · this month ≈ $${ix.monthSpent.toFixed(2)} of $${monthCap}.`);
   if (!o.skipGit && left > 2 && !stop) { try { writeFileSync(join(tmpdir(), "trex-events-more"), "1"); if (!daysDone) writeFileSync(join(tmpdir(), "trex-events-wait"), "1"); } catch (e) {} }

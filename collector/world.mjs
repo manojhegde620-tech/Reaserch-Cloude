@@ -203,7 +203,7 @@ const keepHist = (h, now, days = 9) => (h || []).filter(([t]) => t > now - days 
 
 /* ---------- the run ---------- */
 export async function runWorld(o = {}) {
-  const server = (o.server || process.env.TREX_SERVER || "https://trex.agilenox.in").replace(/\/$/, "");
+  const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
   const key = o.key || process.env.TREX_KEY, F = o.fetch || globalThis.fetch, now = o.now || Date.now();
   const log = o.log || (m => console.log(new Date().toISOString().slice(11, 19) + "  " + m));
   if (!key) { log("World watch: TREX_KEY is not set."); return { ok: false }; }

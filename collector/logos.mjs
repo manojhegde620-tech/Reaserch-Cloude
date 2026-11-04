@@ -1,10 +1,11 @@
 // T-Rex COMPANY LOGOS — runs on GitHub Actions (free), never on Cloudflare.
-// Source: Wikidata, the open database behind Wikipedia. For each company it records the exchange listing with its
-// ticker and/or the company's ISIN, its official website and (often) its logo file. A company is matched ONLY by an
-// exact identifier — its NSE ticker, or its ISIN from NSE's own list of equities (EQUITY_L.csv) — never by guessing
-// a name or a web address, so a wrong logo is not possible by design.
+// Sources, each matched ONLY by an exact identifier (never by guessing a name), so a wrong logo is not possible by design:
+//   a) collector/sites.json — each company's own website as the company itself registered it with BSE
+//      (BSE "Company information": NSE symbol → BSE code → ISIN → website). Refreshed by hand now and then.
+//   b) Wikidata, the open database behind Wikipedia: the NSE listing with its ticker, or the ISIN (from a),
+//      the official website and (often) the logo file.
 //   1) logo file on Wikimedia Commons (P154) → a 128-px PNG thumbnail
-//   2) otherwise the official website (P856) → the site's own app icon / favicon (largest one the site offers)
+//   2) otherwise the company's website → the site's own app icon / favicon (largest one the site offers, at least 32 px)
 // Saved in the "logo-data" branch: l/SYMBOL.png (or .ico/.svg), l/index.json. One commit replaces the branch.
 // Companies without either keep the coloured initials in the app. Logos are public, so these files are not sealed.
 // Run: node collector/logos.mjs   (needs TREX_KEY, GITHUB_TOKEN, GITHUB_REPOSITORY — set by the workflow)
@@ -25,6 +26,20 @@ export function isinMap(csv) {
   if (si < 0 || ii < 0) return {}; const out = {};
   for (const l of lines.slice(1)) { const c = l.split(","); const sym = (c[si] || "").trim().toUpperCase(), isin = (c[ii] || "").trim().toUpperCase(); if (/^IN[A-Z0-9]{10}$/.test(isin) && sym) out[isin] = sym; }
   return out;
+}
+// a website as companies write it ("www.x.com", "http://x.co.in/", "NA", "-") → "https://www.x.com" or ""
+export function cleanSite(u) {
+  const s = String(u || "").trim().split(/[\s,;]+/)[0].replace(/^(https?:)?\/*/i, "").replace(/\/+$/, "");
+  if (!s || /\s/.test(s) || !/^[a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(s) || /(^|\.)(bseindia|nseindia|gmail|yahoo|rediffmail)\./i.test(s)) return "";
+  return "https://" + s.toLowerCase();
+}
+// pixel size of an image (largest side) — PNG / ICO / GIF; null when unknown (JPEG, WebP, SVG)
+export function imgSide(buf, type) {
+  const b = buf || new Uint8Array(0);
+  if (type === "png" && b.length >= 24) return Math.max((b[16] << 24 | b[17] << 16 | b[18] << 8 | b[19]) >>> 0, (b[20] << 24 | b[21] << 16 | b[22] << 8 | b[23]) >>> 0);
+  if (type === "gif" && b.length > 10) return Math.max(b[6] | b[7] << 8, b[8] | b[9] << 8);
+  if (type === "ico" && b.length > 6) { const n = b[4] | b[5] << 8; let m = 0; for (let i = 0; i < n && 6 + 16 * i + 1 < b.length; i++) m = Math.max(m, b[6 + 16 * i] || 256, b[7 + 16 * i] || 256); return m; }
+  return null;
 }
 export const domainOf = u => { try { const x = new URL(/^https?:/i.test(u) ? u : "https://" + u); return x.hostname.replace(/^www\./, "").toLowerCase(); } catch (e) { return ""; } };
 // image type from the first bytes (never trust the server's word for it)
@@ -82,14 +97,23 @@ export async function runLogos(o = {}) {
     OPTIONAL { ?item wdt:P856 ?web } OPTIONAL { ?item wdt:P154 ?logo } }`;
   let rows = [];
   try { const r = await get(`${WDQ}?format=json&query=${encodeURIComponent(q)}`, 90000, { Accept: "application/sparql-results+json" }); const j = await r.json(); rows = (j.results && j.results.bindings) || []; }
-  catch (e) { log("Logos: Wikidata did not answer — " + String(e.message || e).slice(0, 80)); return { ok: false }; }
+  catch (e) { log("Logos: Wikidata did not answer — " + String(e.message || e).slice(0, 80)); rows = []; }
   const info = {}; for (const b of rows) { const t = normTicker(b.ticker && b.ticker.value); if (!t || !want.has(t)) continue; const c = info[t] = info[t] || { web: [], logo: [] };
     if (b.web && !c.web.includes(b.web.value)) c.web.push(b.web.value); if (b.logo && !c.logo.includes(b.logo.value)) c.logo.push(b.logo.value); }
-  // 2b) the same by ISIN: NSE's own list gives each symbol's ISIN; Wikidata items carry the ISIN (P946)
+  const nTick = Object.keys(info).length;
+  // 2a) each company's own website as registered with BSE (collector/sites.json: {sites:{SYM:{isin,web}}})
+  let sites = o.sites || null;
+  if (!sites) { try { sites = JSON.parse(readFileSync(new URL("./sites.json", import.meta.url), "utf8")).sites || {}; } catch (e) { sites = {}; } }
+  const im = {}; let bySite = 0;
+  for (const [s, v] of Object.entries(sites)) { const t = String(s).toUpperCase(); if (!want.has(t) || !v) continue;
+    if (v.isin && /^IN[A-Z0-9]{10}$/.test(v.isin)) im[String(v.isin).toUpperCase()] = t;
+    const w = cleanSite(v.web); if (!w) continue; if (!info[t]) bySite++; const c = info[t] = info[t] || { web: [], logo: [] };
+    if (!c.web.some(x => domainOf(x) === domainOf(w))) c.web.unshift(w); }   // the company's own registered site first
+  log(`Logos: ${Object.keys(sites).length} company websites on file (BSE); ${bySite} more companies covered that way.`);
+  // 2b) Wikidata by ISIN (P946) — ISINs from the same file
   let byIsin = 0;
   try {
-    const csv = await get("https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv", 45000, { Accept: "text/csv,*/*" }).then(r => r.ok ? r.text() : "");
-    const im = isinMap(csv); const nIsin = Object.keys(im).length;
+    const nIsin = Object.keys(im).length;
     if (nIsin) {
       const q2 = `SELECT ?isin ?web ?logo WHERE { ?item wdt:P946 ?isin . FILTER(STRSTARTS(?isin, "INE")) OPTIONAL { ?item wdt:P856 ?web } OPTIONAL { ?item wdt:P154 ?logo } }`;
       const r2 = await get(`${WDQ}?format=json&query=${encodeURIComponent(q2)}`, 90000, { Accept: "application/sparql-results+json" }); const j2 = await r2.json();
@@ -97,25 +121,37 @@ export async function runLogos(o = {}) {
         if (!info[t]) byIsin++; const c = info[t] = info[t] || { web: [], logo: [] };
         if (b.web && !c.web.includes(b.web.value)) c.web.push(b.web.value); if (b.logo && !c.logo.includes(b.logo.value)) c.logo.push(b.logo.value); }
     }
-    log(`Logos: NSE's list has ${nIsin} ISINs; ${byIsin} more companies matched on Wikidata by ISIN.`);
+    log(`Logos: ${nIsin} ISINs checked on Wikidata; ${byIsin} more companies matched by ISIN.`);
   } catch (e) { log("Logos: ISIN match skipped this time — " + String(e.message || e).slice(0, 80)); }
-  log(`Logos: Wikidata lists ${rows.length} NSE listings; ${Object.keys(info).length} of ${want.size} T-Rex companies matched by ticker (${Object.values(info).filter(c => c.logo.length).length} with a logo file, ${Object.values(info).filter(c => c.web.length).length} with a website).`);
+  log(`Logos: Wikidata lists ${rows.length} NSE listings (${nTick} T-Rex companies by ticker); ${Object.keys(info).length} of ${want.size} companies covered in all (${Object.values(info).filter(c => c.logo.length).length} with a logo file, ${Object.values(info).filter(c => c.web.length).length} with a website).`);
   // 3) fetch the image for each matched company that has none yet (or whose last try was > 30 days ago)
-  const save = (sym, buf, type, src) => { if (!type || buf.length > MAXB || buf.length < 100) return false; const f = `${sym}.${type}`; writeFileSync(join(dir, "l", f), buf); ix.logos[sym] = { f, src, t: now }; return true; };
+  let changed = false;
+  if (ix.sv !== 2) {                                       // the website list is new: give every company a fresh try once,
+    ix.tried = {}; ix.sv = 2; changed = true;                             // and drop earlier icons too small to look sharp (< 32 px)
+    for (const [s, v] of Object.entries(ix.logos)) { try { const p = join(dir, "l", v.f), b = readFileSync(p); const side = imgSide(b, imgType(b));
+      if (side != null && side < 32) { delete ix.logos[s]; rmSync(p, { force: true }); } } catch (e) { delete ix.logos[s]; } }
+  }
+  const save = (sym, buf, type, src) => { if (!type || buf.length > MAXB || buf.length < 100) return false;
+    if (src === "site" && type === "svg") return false;      // site SVGs can carry scripts / odd sizes — keep to bitmaps
+    const side = imgSide(buf, type); if (side != null && side < 32) return false;   // a 16-px favicon would look blurred
+    const f = `${sym}.${type}`; writeFileSync(join(dir, "l", f), buf); ix.logos[sym] = { f, src, t: now }; return true; };
   const fetchBuf = async (url, ms) => { const r = await get(url, ms); if (!r.ok) return null; const b = new Uint8Array(await r.arrayBuffer()); return b; };
-  let added = 0, tried = 0; const todo = Object.keys(info).filter(s => !ix.logos[s] && (!ix.tried[s] || now - ix.tried[s] > 30 * 864e5)).slice(0, o.max || 400);
+  let added = 0, tried = 0; const todo = Object.keys(info).filter(s => !ix.logos[s] && (!ix.tried[s] || now - ix.tried[s] > 30 * 864e5)).slice(0, o.max || 3000);
+  const until = now + (o.budgetMs || 40 * 60e3);           // stop in time to save; the rest is picked up next run
   for (const sym of todo) {
+    if (!o.now && Date.now() > until) { log("Logos: time is up for this run — the rest next time."); break; }
     tried++; ix.tried[sym] = now; const c = info[sym]; let ok = false;
     for (const lf of c.logo.slice(0, 2)) {                 // Commons file → PNG thumbnail 128 px wide
       if (ok) break; const name = decodeURIComponent(String(lf).split("/").pop() || ""); if (!name) continue;
       try { const b = await fetchBuf(`https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(name)}?width=128`, 20000); ok = !!(b && save(sym, b, imgType(b), "wikidata")); } catch (e) {}
     }
-    for (const w of c.web.slice(0, 1)) {                   // the company's own site: its biggest app icon / favicon
+    for (const w of c.web.slice(0, 2)) {                   // the company's own site: its biggest app icon / favicon
       if (ok) break; const d = domainOf(w); if (!d) continue;
-      try { const r = await get(w, 15000, { Accept: "text/html" }); const html = r.ok ? (await r.text()).slice(0, 300000) : ""; const icons = pageIcons(html, r.url || w);
-        for (const u of [...icons.map(x => x.url), `https://${d}/apple-touch-icon.png`, `https://www.${d}/apple-touch-icon.png`, `https://${d}/favicon.ico`]) {
-          try { const b = await fetchBuf(u, 12000); if (b && save(sym, b, imgType(b), "site")) { ok = true; break; } } catch (e) {} }
-      } catch (e) {}
+      let icons = [];
+      try { const r = await get(w, 15000, { Accept: "text/html" }); const html = r.ok ? (await r.text()).slice(0, 300000) : ""; icons = pageIcons(html, r.url || w); } catch (e) {}
+      for (const u of [...icons.map(x => x.url).slice(0, 6), `https://${d}/apple-touch-icon.png`, `https://www.${d}/apple-touch-icon.png`, `https://${d}/favicon.ico`, `https://www.${d}/favicon.ico`,
+                       `https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=128`]) {   // last: Google's copy of the same site's icon
+        try { const b = await fetchBuf(u, 12000); if (b && save(sym, b, imgType(b), "site")) { ok = true; break; } } catch (e) {} }
     }
     if (ok) added++;
     if (o.gap) await new Promise(r => setTimeout(r, o.gap));
@@ -123,7 +159,7 @@ export async function runLogos(o = {}) {
   ix.t = now; ix.v = 1; writeFileSync(ixPath, JSON.stringify(ix));
   const total = Object.keys(ix.logos).length;
   log(`Logos: ${added} new logos this run (${tried} companies tried) · ${total} companies have a logo in total.`);
-  if (!o.skipGit && (added || !existsSync(join(dir, ".git", "refs", "heads", BRANCH)))) {
+  if (!o.skipGit && (added || changed || !existsSync(join(dir, ".git", "refs", "heads", BRANCH)))) {
     try { git("add", "-A"); const tree = git("write-tree"); const c = git("commit-tree", tree, "-m", `logos: ${total} companies`); git("update-ref", "HEAD", c);
       git("push", "--quiet", "--force", "origin", "HEAD:" + BRANCH); log("Logos: saved to GitHub."); }
     catch (e) { log("Logos: could not save — " + String((e.stderr && e.stderr.toString()) || e.message || e).replace(/x-access-token:[^@]+@/g, "x-access-token:***@").slice(0, 200)); }

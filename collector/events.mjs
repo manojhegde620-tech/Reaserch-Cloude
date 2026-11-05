@@ -27,6 +27,24 @@ const MON = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, se
 // NSE dates: "04-Nov-2026 15:42:10" → "2026-11-04"
 export function nseDay(s) { const m = String(s || "").match(/(\d{1,2})[-\s]([A-Za-z]{3})[A-Za-z]*[-\s](\d{4})/); if (m && MON[m[2].toLowerCase()]) return `${m[3]}-${String(MON[m[2].toLowerCase()]).padStart(2, "0")}-${m[1].padStart(2, "0")}`; const n = String(s || "").match(/(\d{4})-(\d{2})-(\d{2})/); return n ? n[0] : ""; }
 
+// ---------- 0) results PDFs (free, no AI): the company's own results document from NSE's announcements ----------
+// Many companies file their numbers only as an "integrated filing" (a data file + a web view). The readable PDF of the
+// results is attached to the "Financial Result Updates" / "Outcome of Board Meeting" announcement. T-Rex links ONLY that
+// PDF ("Results PDF · NSE") — never the data file or its web view.
+const RP_NOT = /newspaper|publication|advertisement|press release|investor presentation|earnings call|conference call|analyst|transcript|audio|video|intimation of (board )?meeting|prior intimation|trading window/i;
+export function resultsPdfRow(row) {
+  const u = String((row && row.attchmntFile) || "").trim();
+  if (!/^https:\/\/[^\s"'<>]+\.pdf$/i.test(u) || /xbrl/i.test(u)) return null;
+  const subj = String(row.desc || "").replace(/\s+/g, " ").trim(), text = String(row.attchmntText || "").replace(/\s+/g, " ").trim();
+  if (RP_NOT.test(subj + " " + text)) return null;
+  const res = /financial results?/i.test(subj)
+    || (/outcome of (the )?board meeting|board meeting outcome/i.test(subj) && /results?/i.test(text) && /quarter|half[- ]year|year ended|period ended|un-?audited|audited/i.test(text));
+  if (!res) return null;
+  const s = String(row.symbol || "").toUpperCase().trim(), d = nseDay(row.an_dt || row.sort_date);
+  if (!/^[A-Z0-9&-]{1,20}$/.test(s) || !d) return null;
+  return { s, d, u, t: subj.slice(0, 100) };
+}
+
 // ---------- 1) the free first sort: is this filing possibly a big event? (subject + NSE's one-line text) ----------
 const ROUTINE = /newspaper|trading window|record date|book closure|shareholders meeting|agm|egm notice|esop|esos|esps|loss of share|duplicate share|certificate under|compliance certificate|statement of investor complaints|reg(ulation)?\.? ?74|closure of trading|change in (registered )?address|address change|investor meet|con\. ?call|analysts?\/institutional|monitoring agency|statement of deviation|integrated filing|financial results|clarification|price movement|spurt in volume|news verification|committee meeting|dividend|retirement|change in company secretary|cessation|appointment|change in director/i;
 const RULES = [
@@ -323,6 +341,9 @@ export async function runEvents(o = {}) {
     const how = addEvent(c.events, ev); if (how === "seen") return; c.events = c.events.slice(0, 120); await saveCo(sym, c); nKept++;
     if (ix.monthSpent + spentNow() >= monthCap) { stop = true; log(`Events: this month's budget of $${monthCap} is reached.`); }
   };
+  // results PDFs found in the day lists read by this run (+ older days below), sent to T-Rex at the end
+  ix.rpDays = ix.rpDays || {}; const rpRows = [], rpSeen = new Set();
+  const rpTake = (d, rows) => { for (const row of rows) { const p = resultsPdfRow(row); if (p && !rpSeen.has(p.s + "|" + p.u)) { rpSeen.add(p.s + "|" + p.u); rpRows.push(p); } } rpSeen.add("day:" + d); };
   let lastSave = Date.now();
   for (const d of days) {
     if (stop || Date.now() > until - 90e3) break;
@@ -330,6 +351,7 @@ export async function runEvents(o = {}) {
     const r = await nseJson(`https://www.nseindia.com/api/corporate-announcements?index=equities&from_date=${dmy(dd)}&to_date=${dmy(dd)}`);
     if (r.code !== 200) { blocked++; if (blocked >= 4) { log("Events: NSE keeps refusing — stopping for this run."); break; } await sleep(10000 * blocked); await session(); continue; }
     blocked = 0; const rows = Array.isArray(r.j) ? r.j : ((r.j && r.j.data) || []); nRows += rows.length;
+    rpTake(d, rows);
     let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_EVENTS_PARALLEL || 6);
     const worker = async () => { while (next < rows.length && !stop) await one(rows[next++]); };
     await Promise.all(Array.from({ length: par }, worker));
@@ -338,6 +360,29 @@ export async function runEvents(o = {}) {
   }
   ix.monthSpent = +(ix.monthSpent + spentNow()).toFixed(4); ix.spent = +(ix.spent + spentNow()).toFixed(4); ix.n = (ix.n || 0) + nKept;
   const left = days.filter(d => !ix.days[d]).length;
+  // results PDFs: also the older days (last ~4 months) whose list was not read for this yet — one list per day, no AI
+  let rpSent = 0;
+  if (!o.noAnn) {
+    const rpBack = o.rpBack ?? (+process.env.TREX_RP_BACK || 130); let rpBlocked = 0;
+    for (let i = 0; i <= rpBack; i++) {
+      if (Date.now() > until - 60e3) break;
+      const d = isoDay(now - i * 864e5); if (rpSeen.has("day:" + d) || (i >= 2 && ix.rpDays[d])) continue;
+      const dd = new Date(d + "T00:00:00Z");
+      const r = await nseJson(`https://www.nseindia.com/api/corporate-announcements?index=equities&from_date=${dmy(dd)}&to_date=${dmy(dd)}`);
+      if (r.code !== 200) { rpBlocked++; if (rpBlocked >= 4) break; if (!o.nseJson) { await sleep(8000 * rpBlocked); await session(); } continue; }
+      rpBlocked = 0; rpTake(d, Array.isArray(r.j) ? r.j : ((r.j && r.j.data) || []));
+      if (!o.nseJson) await sleep(800);
+    }
+    const daysRead = [...rpSeen].filter(x => x.startsWith("day:")).map(x => x.slice(4));
+    let okRp = true;
+    for (let i = 0; i < rpRows.length || (i === 0 && daysRead.length); i += 500) {
+      const part = rpRows.slice(i, i + 500); if (!part.length) break;
+      try { const pr = await F(`${server}/api/ann`, { method: "POST", headers: { "x-trex-key": key, "content-type": "application/json" }, body: JSON.stringify({ action: "respdf", rows: part }), signal: AbortSignal.timeout(90000) });
+        const pj = await pr.json(); if (pj && pj.ok) rpSent += pj.saved || 0; else okRp = false; } catch (e) { okRp = false; }
+    }
+    if (okRp) { for (const d of daysRead) if (d !== isoDay(now) && d !== isoDay(now - 864e5)) ix.rpDays[d] = 1; dirty = true; }
+    log(`Events: ${rpRows.length} results PDFs found in ${daysRead.length} days of announcements, ${rpSent} sent to T-Rex${okRp ? "" : " — some could not be sent, tried again next run"}.`);
+  }
   // to T-Rex's database: the companies changed in this run; the first time the whole history; once a day every company's size
   let annSent = 0;
   if (!o.noAnn) {

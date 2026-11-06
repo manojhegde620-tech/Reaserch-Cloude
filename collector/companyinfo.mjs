@@ -25,8 +25,15 @@ export function shpPledge(xml) {
   return { pledged: flag ? /^yes$/i.test(flag) : best > 0, pledgedShares: best, pctReported: pctTags.length ? Math.max(...pctTags) : null };
 }
 
-export async function runCompanyInfo({ trex, nse, log, until, publicLog = process.env.TREX_PUBLIC_LOG === "1" }) {
-  const st = { companies: 0, industries: 0 };
+// the sector from NSE's quote-page data (equityResponse[0].secInfo.sector); null when the page has none
+export function quoteSector(txt) {
+  try { const j = JSON.parse(txt); const e = Array.isArray(j && j.equityResponse) ? j.equityResponse[0] : null;
+    const v = e && e.secInfo && typeof e.secInfo.sector === "string" ? e.secInfo.sector.replace(/\s+/g, " ").trim() : "";
+    return v && !/^(-|na|n\/a|null)$/i.test(v) ? v.slice(0, 60) : null; } catch (e) { return null; }
+}
+
+export async function runCompanyInfo({ trex, nse, log, until, publicLog = process.env.TREX_PUBLIC_LOG === "1", gap = 700 }) {
+  const st = { companies: 0, industries: 0, sectors: 0 };
   const tg = await trex("cinfotargets");
   if (!tg || !tg.ok) { log("Company info: T-Rex problem: " + (tg && tg.error)); return st; }
   const name = s => publicLog ? "[company]" : s;
@@ -44,6 +51,32 @@ export async function runCompanyInfo({ trex, nse, log, until, publicLog = proces
     }
     const uniq = [...new Map(rows.map(r => [r[0], r])).values()];
     if (uniq.length >= 100) { const res = await trex("industries", {}, JSON.stringify({ rows: uniq })); if (res && res.ok) { st.industries = uniq.length; log(`Company info: industries of ${uniq.length} companies updated (Nifty index lists).`); } }
+  }
+  // 1b) industry of every other company (results or announcements, not in the index lists): NSE's own classification from
+  //     the company's quote page — the same sector names as the index lists. A few minutes per run until all are done.
+  if (Date.now() < until - 90e3) {
+    const it = await trex("indtargets");
+    const todo = (it && it.ok && it.symbols) || [], stopAt = Math.min(until - 60e3, Date.now() + 4 * 60e3), rows = [], odd = []; let bad = 0, asked = 0, found = 0;
+    for (const sym of todo) {
+      if (Date.now() > stopAt || bad >= 8) break;
+      const r = await nse(`https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolData&marketType=N&series=EQ&symbol=${encodeURIComponent(sym)}`, 20000);
+      if (r.code !== 200 || !r.body) { bad++; rows.push([sym, null]); await sleep(gap * 2); continue; }   // asked again in 7 days; NSE busy / blocked: stop after a few
+      let sec = quoteSector(r.body.toString("utf8"));
+      if (!sec) {                                                    // some trade in another series (BE, BZ …): ask NSE which, then once more
+        await sleep(gap); const m = await nse(`https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getMetaData&symbol=${encodeURIComponent(sym)}`, 20000);
+        let ser = null, mt = "N"; try { const j = JSON.parse(m.body ? m.body.toString("utf8") : "{}"); ser = (j.activeSeries || [])[0] || null; mt = /^[A-Z]$/.test(j.marketType || "") ? j.marketType : "N"; } catch (e) {}
+        if (ser && /^[A-Z0-9]{1,3}$/.test(ser) && (ser !== "EQ" || mt !== "N")) { await sleep(gap);
+          const r2 = await nse(`https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolData&marketType=${mt}&series=${ser}&symbol=${encodeURIComponent(sym)}`, 20000);
+          if (r2.code === 200 && r2.body) sec = quoteSector(r2.body.toString("utf8")); }
+      }
+      rows.push([sym, sec]); asked++; if (sec) found++; bad = 0;
+      if (rows.length >= 50) { const res = await trex("industry1", {}, JSON.stringify({ rows: rows.splice(0) })); odd.push(...((res && res.odd) || [])); }
+      await sleep(gap);
+    }
+    if (rows.length) { const res = await trex("industry1", {}, JSON.stringify({ rows })); odd.push(...((res && res.odd) || [])); }
+    st.sectors = found;
+    if (todo.length) log(`Company info: industry looked up on NSE for ${asked} compan${asked === 1 ? "y" : "ies"} (${found} found; ${Math.max(0, ((it && it.left) || 0) - asked)} still waiting${bad >= 8 ? "; NSE not answering, will retry next run" : ""}).`);
+    if (odd.length) log(`  Industry names not recognised (not stored): ${odd.slice(0, 5).join("; ")}`);
   }
   // 2) per company: shareholding pattern (promoter %, pledges) + face value / paid-up capital
   for (const t of tg.targets || []) {

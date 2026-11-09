@@ -1,0 +1,27 @@
+# T-Rex ownership & delivery: every 2 hours GitHub reads NSE's public data — FII / DII buying and selling, each stock's
+# delivered quantity, promoter / insider trades, bulk and block deals, and quarterly shareholding — and hands it to T-Rex.
+# Each run is limited to about 14 minutes; the first runs fill in the history (about 3 days), then only new data.
+name: T-Rex ownership and delivery
+on:
+  schedule:
+    - cron: "7 */2 * * *"       # every 2 hours (UTC)
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: trex-owndata
+  cancel-in-progress: false
+jobs:
+  owndata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Read NSE ownership and delivery data
+        run: node collector/owndata.mjs
+        env:
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          TREX_MAX_MINUTES: "14"

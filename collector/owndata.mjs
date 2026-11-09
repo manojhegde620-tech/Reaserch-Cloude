@@ -45,7 +45,8 @@ export function shpParse(xml) {
   const sh = c => { const o = f[c + "_ContextI"]; if (!o) return null; return num(o.NumberOfShares ?? o.NumberOfFullyPaidUpEquityShares); };
   const tot = sh("ShareholdingPattern"), pro = sh("ShareholdingOfPromoterAndPromoterGroup"), pub = sh("PublicShareholding");
   let fii = sh("InstitutionsForeign"); if (fii == null) { const a = sh("InstitutionsForeignPortfolioInvestorCategoryOne"), b = sh("InstitutionsForeignPortfolioInvestorCategoryTwo"); if (a != null || b != null) fii = (a || 0) + (b || 0); }
-  return { tot, pro, pub, fii, dii: sh("InstitutionsDomestic"), mf: sh("MutualFundsOrUTI") };
+  // nn: shares behind depository receipts / employee trusts ("non-promoter non-public") — NSE's percentages leave them out
+  return { tot, pro, pub, fii, dii: sh("InstitutionsDomestic"), mf: sh("MutualFundsOrUTI"), nn: sh("SharesHeldByNonPromoterNonPublicShareholders") };
 }
 // NSE "sec_bhavdata_full" CSV → { date, rows:[[SYM, traded qty, delivered qty, close]] } (EQ preferred, then BE / BZ / SM / ST)
 export function dlvParse(text) {
@@ -140,8 +141,9 @@ export async function runOwn(o = {}) {
     const from = st.dealsFrom || iso(ist); if (from > iso(ist - 180 * 864e5)) { const end = new Date(Date.parse(from) - 864e5).getTime(); spans.push([iso(end - 29 * 864e5), iso(end)]); }
     for (const [a, b] of spans) { const rows = [];
       for (const kind of ["bulk", "block"]) { const r = await nse(`https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=${kind}_deals&from=${dmy(a)}&to=${dmy(b)}`, 40000);
-        try { rows.push(...dealsParse(JSON.parse(r.text), kind)); } catch (e) {} await sleep(gap); }
-      const res = await trex({ action: "deals", rows, from: a }); if (res && res.ok) done.deals += res.saved; } }
+        try { rows.push(...dealsParse(JSON.parse(r.text), kind)); } catch (e) { log(`Deals ${kind} ${a}–${b}: NSE answered ${r.code} (${String(r.text || "").slice(0, 60).replace(/\s+/g, " ")})`); } await sleep(gap); }
+      const res = await trex({ action: "deals", rows, from: a }); if (res && res.ok) done.deals += res.saved; else log(`Deals ${a}–${b}: ${res && res.error}`); }
+    log(`Deals: ${done.deals} bulk / block deal(s) stored.`); }
 
   // 5) quarterly shareholding: NSE's list for the last five quarters, then the files still missing (most useful first)
   if (left(120e3)) { const ist = new Date(Date.now() + 5.5 * 3600e3), rows = [];

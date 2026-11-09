@@ -8,6 +8,7 @@
 // Every step is limited in time and number, and is safe to stop at any point: the next run continues where this one left off.
 // Nothing is estimated here — files are read and the numbers sent as found; T-Rex checks them again before storing.
 import { pathToFileURL } from "node:url";
+import zlib from "node:zlib";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const REF = "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading";
@@ -96,6 +97,11 @@ export async function runOwn(o = {}) {
       } catch (e) { if (t >= 3) return { ok: false, error: "could not reach T-Rex" }; await sleep(4000 * t); }
     }
   }
+  async function collect(action, params, body) {             // T-Rex's main collector endpoint (closing prices), gzip like collect.mjs
+    try { const qs = new URLSearchParams({ action, ...(params || {}) }); const h = { "x-trex-key": key }; let b;
+      if (body != null) { h["x-trex-gz"] = "1"; b = zlib.gzipSync(Buffer.from(body)); }
+      const r = await F(`${server}/api/collect?${qs}`, { method: "POST", headers: h, body: b, signal: AbortSignal.timeout(90000) }); return JSON.parse(await r.text()); } catch (e) { return { ok: false, error: "could not reach T-Rex" }; }
+  }
   const st = await trex({ action: "status" }); if (!st || !st.ok) { log("Could not use T-Rex: " + (st && st.error)); return { ok: false }; }
   await session(); const done = { fii: 0, days: 0, pit: 0, deals: 0, shp: 0 };
   const left = ms => Date.now() < until - (ms || 0);
@@ -104,21 +110,36 @@ export async function runOwn(o = {}) {
   { const r = await nse("https://www.nseindia.com/api/fiidiiTradeReact", 20000); let rows = []; try { rows = JSON.parse(r.text); } catch (e) {}
     if (Array.isArray(rows) && rows.length) { const res = await trex({ action: "fii", rows }); if (res && res.ok) done.fii = res.saved; } }
 
-  // 2) delivery: the last ~65 weekdays not stored yet (newest first), at most 12 files a run
+  // 2) delivery: the last ~65 trading days not stored yet (newest first), at most 12 files a run
+  let bhav = null;
   { const have = new Set([...(st.days || []), ...(st.miss || [])]); const ist = new Date(Date.now() + 5.5 * 3600e3); const want = [];
-    for (let d = 0; want.length < 66 && d < 110; d++) { const day = new Date(ist.getTime() - d * 864e5); const wd = day.getUTCDay(); if (wd === 0 || wd === 6) continue; const iso = day.toISOString().slice(0, 10);
+    for (let d = 0; want.length < 92 && d < 100; d++) { const day = new Date(ist.getTime() - d * 864e5); const wd = day.getUTCDay(); const iso = day.toISOString().slice(0, 10);
+      if ((wd === 0 || wd === 6) && d > 10) continue;                     // weekends: only recent ones (NSE sometimes trades on a weekend, e.g. Muhurat trading)
       if (d === 0 && ist.getUTCHours() < 19) continue;                     // today's file appears in the evening
       want.push(iso); }
     let n = 0;
-    for (const iso of want) { if (have.has(iso)) continue; if (n >= (o.maxDays || 12) || !left(60e3)) break; n++;
+    for (const iso of want) { if (have.has(iso)) continue; if (n >= (o.maxDays || 14) || !left(60e3)) break; n++;
       const r = await nse(`https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${iso.slice(8, 10)}${iso.slice(5, 7)}${iso.slice(0, 4)}.csv`, 45000);
       if (r.code === 404 || r.code === 403 && /not\s*found/i.test(r.text)) {             // no file: a holiday — remembered only once the day is safely past (a late file is not lost)
         if (iso < new Date(ist.getTime() - 3 * 864e5).toISOString().slice(0, 10)) await trex({ action: "dlvmiss", date: iso }); continue; }
       if (r.code !== 200 || r.text.length < 10000) { log(`Delivery ${iso}: NSE answered ${r.code}`); continue; }
+      if (!bhav || iso > bhav.iso) bhav = { iso, text: r.text };          // the newest NSE closing-price file seen this run (step 2b)
       const p = dlvParse(r.text); if (p.err) { log(`Delivery ${iso}: ${p.err}`); continue; }
       const res = await trex({ action: "dlv", date: iso, rows: p.rows, rebuild: false }); if (res && res.ok) done.days++; else log(`Delivery ${iso}: ${res && res.error}`);
       await sleep(gap); }
     if (done.days) { const b = await trex({ action: "dlvbuild" }); log(`Delivery: ${done.days} trading day(s) added (${b && b.days} days kept).`); } }
+
+  // 2b) NSE's official closing prices (the day change % is measured against them): if T-Rex's newest file is older than one
+  //     NSE has published — including a weekend special session such as Muhurat trading — send it (same check as the main collector)
+  if (left(60e3)) { try {
+    const cs = await collect("status"); const have = (cs && cs.ok && cs.priceDate) || null;
+    if (cs && cs.ok) {
+      const ist = new Date(Date.now() + 5.5 * 3600e3); let file = bhav && (!have || bhav.iso > have) ? bhav : null;
+      if (!file) for (let d = 0; d < 7; d++) { const iso = new Date(ist.getTime() - d * 864e5).toISOString().slice(0, 10); if (have && iso <= have) break; if (d === 0 && ist.getUTCHours() < 18) continue;
+        const r = await nse(`https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${iso.slice(8, 10)}${iso.slice(5, 7)}${iso.slice(0, 4)}.csv`, 45000);
+        if (r.code === 200 && r.text.length > 10000) { file = { iso, text: r.text }; break; } await sleep(gap); }
+      if (file) { const res = await collect("prices", { date: file.iso }, file.text); log(res && res.ok ? `Closing prices of ${file.iso} sent (${res.prices} stocks).` : `Closing prices of ${file.iso}: ${res && res.error}`); }
+    } } catch (e) { log("Closing prices step skipped: " + (e.message || e)); } }
 
   // 3) insider / promoter trades: the list (≈ 6 months), then each new filing's small file
   if (left(90e3)) { const r = await nse("https://www.nseindia.com/api/corporates-pit-gg?index=equities", 60000); let list = [];

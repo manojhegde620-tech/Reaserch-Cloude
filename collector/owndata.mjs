@@ -129,7 +129,7 @@ export async function runOwn(o = {}) {
     const stopPit = Math.min(until - 45e3, Date.now() + (o.pitMinutes || 5) * 60e3);       // leave time for the other steps
     for (const x of todo) { if (Date.now() > stopPit) break;
       const f = await nse(x.xmlFileName, 30000); if (f.code !== 200 || !/<xbrl|<xbrli:xbrl/i.test(f.text)) { await sleep(gap * 3); continue; }
-      const p = pitParse(f.text); batch.push({ id: idOf(x), s: p.s || String(x.symbol).toUpperCase(), bd: String(x.broadcastDateTime || "").slice(0, 11), rows: p.rows });
+      const p = pitParse(f.text); batch.push({ id: idOf(x), s: p.s || String(x.symbol).toUpperCase(), bd: String(x.broadcastDateTime || "").slice(0, 11), rev: /revis/i.test(String(x.typeOfSubmission || "")), rows: p.rows });
       if (batch.length >= 40) { const res = await trex({ action: "pit", filings: batch.splice(0), backfill }); if (res && res.ok) done.pit += res.rows; }
       await sleep(gap); }
     if (batch.length) { const res = await trex({ action: "pit", filings: batch, backfill }); if (res && res.ok) done.pit += res.rows; }

@@ -141,7 +141,12 @@ export async function run(o = {}) {
   }
 
   // 2) XBRL files, a few at a time
-  const seen = new Set(); let blocks = 0, stop = false; const touched = new Set();
+  const seen = new Set(); let blocks = 0, stop = false, tinyFiles = 0; const touched = new Set();
+  const accept = async (f, body) => {
+    const res = await trex("file", { symbol: f.symbol, qe: f.qe, xbrl: f.xbrl }, body, true);
+    if (res && res.ok) { files++; writes += 5; budget -= 5; touched.add(f.symbol); blocks = 0; if (files % 200 === 0) log(`${files} filings read`); }
+    else { failed++; log(`Not accepted: ${f.symbol} ${f.qe} — ${res && res.error}`); }
+  };
   while (!stop && Date.now() < until && budget > 50) {
     const pend = await trex("pending", { limit: 200 });
     if (!pend || !pend.ok) { log("T-Rex problem: " + (pend && pend.error)); break; }
@@ -154,11 +159,17 @@ export async function run(o = {}) {
         if (budget < 10) { note = "daily write limit"; stop = true; log("Reached today's safe database limit — the next run continues."); break; }
         const f = todo[i++]; await sleep(gap);
         const r = await nse(f.xbrl);
-        if (r.code === 200 && r.body && r.body.length > 300) {
-          const res = await trex("file", { symbol: f.symbol, qe: f.qe, xbrl: f.xbrl }, r.body, true);
-          if (res && res.ok) { files++; writes += 5; budget -= 5; touched.add(f.symbol); blocks = 0; if (files % 200 === 0) log(`${files} filings read`); }
-          else { failed++; log(`Not accepted: ${f.symbol} ${f.qe} — ${res && res.error}`); }
-        } else if (r.code === 404 || r.code === 410) { await trex("fail", {}, JSON.stringify({ symbol: f.symbol, qe: f.qe, xbrl: f.xbrl })); failed++; }
+        if (r.code === 200 && r.body && r.body.length > 300) await accept(f, r.body);
+        else if (r.code === 404 || r.code === 410) { await trex("fail", {}, JSON.stringify({ symbol: f.symbol, qe: f.qe, xbrl: f.xbrl })); failed++; }
+        else if (r.code === 200) {
+          // NSE answered but sent an empty / tiny file (seen 7–9 Nov 2026: one filing, every run). Not a refusal: one more
+          // try on a fresh connection; then it counts as one failed try (3 runs → unreadable, tried again weekly). If many
+          // files come back empty and none is read, NSE is blocking in disguise → stop without counting anything.
+          const r2 = await pdfGet(f.xbrl, 60000);
+          if (r2.code === 200 && r2.body && r2.body.length > 300) await accept(f, r2.body);
+          else if (files === 0 && ++tinyFiles > 3) { note = "empty answers"; stop = true; log("NSE keeps sending empty files — stopping; the next run continues."); break; }
+          else { await trex("fail", {}, JSON.stringify({ symbol: f.symbol, qe: f.qe, xbrl: f.xbrl })); failed++; log(`NSE sent an empty file for ${f.symbol} ${f.qe} (${r.body ? r.body.length : 0} bytes) — counted as one failed try (after 3 it is marked unreadable).`); }
+        }
         else {
           blocks++; log(`NSE answered ${r.code} for ${f.symbol} — pausing`); seen.delete(f.xbrl);
           if (blocks >= 6) { note = "files refused"; stop = true; log("NSE keeps refusing — stopping; the next run continues."); break; }

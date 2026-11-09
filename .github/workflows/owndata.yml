@@ -4,24 +4,35 @@
 name: T-Rex ownership and delivery
 on:
   schedule:
-    - cron: "7 */2 * * *"       # every 2 hours (UTC)
+    - cron: "7 */2 * * *"       # every 2 hours (UTC) — a backup start: GitHub often starts scheduled runs hours late, so each run also starts the next one
   workflow_dispatch:
 permissions:
   contents: read
+  actions: write       # to start the next run 2 hours after this one started
 concurrency:
   group: trex-owndata
   cancel-in-progress: false
 jobs:
   owndata:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 140
     steps:
+      - name: Note the start time
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Read NSE ownership and delivery data
         run: node collector/owndata.mjs
+        timeout-minutes: 25
         env:
           TREX_KEY: ${{ secrets.TREX_KEY }}
           TREX_MAX_MINUTES: "14"
+      - name: Start the next run 2 hours after this one started (GitHub's own timer is unreliable)
+        if: always()
+        run: |
+          w=$(( 7200 - ( $(date +%s) - T0 ) )); if [ "$w" -gt 0 ]; then echo "Waiting $((w/60)) minutes"; sleep "$w"; fi
+          for i in 1 2 3 4 5; do gh workflow run owndata.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."
+        env:
+          GH_TOKEN: ${{ github.token }}

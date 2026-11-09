@@ -5,19 +5,21 @@
 name: T-Rex important announcements
 on:
   schedule:
-    - cron: "41 */2 * * *"      # every 2 hours (UTC)
+    - cron: "41 */2 * * *"      # every 2 hours (UTC) — a backup start: GitHub often starts scheduled runs hours late, so each run also starts the next one
   workflow_dispatch:
 permissions:
   contents: write      # to save the results in the event-data branch
-  actions: write       # to start the next run straight away while older days remain
+  actions: write       # to start the next run: straight away while older days remain, otherwise 2 hours after this one started
 concurrency:
   group: trex-events
   cancel-in-progress: false
 jobs:
   events:
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 150
     steps:
+      - name: Note the start time
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -26,6 +28,7 @@ jobs:
         run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext   # retried: GitHub's package mirror sometimes fails
       - name: Read important announcements
         run: node collector/events.mjs
+        timeout-minutes: 70
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
           TREX_KEY: ${{ secrets.TREX_KEY }}
@@ -35,8 +38,8 @@ jobs:
           TREX_EVENTS_PARALLEL: "6"
           TREX_EVENTS_BUDGET_USD: "40"     # at most this much Claude credit per calendar month for announcements
           TREX_EVENTS_BACK_DAYS: "730"     # fill two years of history (once), then only new filings
-      - name: Start the next run if older days remain
+      - name: Start the next run (straight away while older days remain, otherwise 2 hours after this one started)
         if: always()
-        run: if [ "${{ job.status }}" != "success" ]; then echo "This run failed (GitHub trouble?) - trying again in 15 minutes."; sleep 900; touch /tmp/trex-events-more; fi; if [ -f /tmp/trex-events-more ]; then if [ -f /tmp/trex-events-wait ]; then echo "No day finished this run (NSE busy) - waiting 15 minutes."; sleep 900; fi; for i in 1 2 3 4 5; do gh workflow run events.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."; else echo "Up to date."; fi
+        run: if [ "${{ job.status }}" != "success" ]; then echo "This run failed (GitHub trouble?) - trying again in 15 minutes."; sleep 900; touch /tmp/trex-events-more; fi; if [ -f /tmp/trex-events-more ]; then if [ -f /tmp/trex-events-wait ]; then echo "No day finished this run (NSE busy) - waiting 15 minutes."; sleep 900; fi; else w=$(( 7200 - ( $(date +%s) - T0 ) )); echo "Up to date."; if [ "$w" -gt 0 ]; then echo "Next run in $((w/60)) minutes (GitHub's own timer is unreliable)."; sleep "$w"; fi; fi; for i in 1 2 3 4 5; do gh workflow run events.yml --ref main --repo "$GITHUB_REPOSITORY" && break; echo "GitHub did not accept the start — trying again in 60 s"; sleep 60; done; echo "Next run started."
         env:
           GH_TOKEN: ${{ github.token }}

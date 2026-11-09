@@ -132,14 +132,19 @@ export async function runOwn(o = {}) {
   // 2b) NSE's official closing prices (the day change % is measured against them): if T-Rex's newest file is older than one
   //     NSE has published — including a weekend special session such as Muhurat trading — send it (same check as the main collector)
   if (left(60e3)) { try {
-    const cs = await collect("status"); const have = (cs && cs.ok && cs.priceDate) || null;
+    const cs = await collect("status"); const have = (cs && cs.ok && cs.priceDate) || null, probe = (cs && cs.priceProbe) || {};
     if (cs && cs.ok) {
-      const ist = new Date(Date.now() + 5.5 * 3600e3); let file = bhav && (!have || bhav.iso > have) ? bhav : null;
-      if (!file) for (let d = 0; d < 7; d++) { const iso = new Date(ist.getTime() - d * 864e5).toISOString().slice(0, 10); if (have && iso <= have) break; if (d === 0 && ist.getUTCHours() < 18) continue;
+      const ist = new Date(Date.now() + 5.5 * 3600e3); let file = bhav && (!have || bhav.iso >= have) ? bhav : null;
+      if (!file) for (let d = 0; d < 7; d++) { const iso = new Date(ist.getTime() - d * 864e5).toISOString().slice(0, 10); if (have && iso < have) break; if (d === 0 && ist.getUTCHours() < 18) continue;
         const r = await nse(`https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${iso.slice(8, 10)}${iso.slice(5, 7)}${iso.slice(0, 4)}.csv`, 45000);
         if (r.code === 200 && r.text.length > 10000) { file = { iso, text: r.text }; break; } await sleep(gap); }
-      if (file) { const res = await collect("prices", { date: file.iso }, file.text); log(res && res.ok ? `Closing prices of ${file.iso} sent (${res.prices} stocks).` : `Closing prices of ${file.iso}: ${res && res.error}`); }
-    } } catch (e) { log("Closing prices step skipped: " + (e.message || e)); } }
+      // the same day as T-Rex's file: send again only when T-Rex's closes differ from NSE's file (an early / wrong file was stored)
+      let send = file && (!have || file.iso > have);
+      if (file && !send && file.iso === have) { const p = dlvParse(file.text); const mine = {}; for (const r of (p.rows || [])) mine[r[0]] = r[3];
+        const diff = Object.keys(probe).filter(s => mine[s] > 0 && Math.abs(mine[s] - probe[s]) > 0.001); if (diff.length) { send = true; log(`Closing prices of ${file.iso}: T-Rex's copy differs from NSE's file (${diff.slice(0, 3).join(", ")}) — sending it again.`); } }
+      if (send) { const res = await collect("prices", { date: file.iso }, file.text); log(res && res.ok ? `Closing prices of ${file.iso} sent (${res.prices} stocks).` : `Closing prices of ${file.iso}: ${res && res.error}`); }
+    } else log("Closing prices: T-Rex status not available.");
+    } catch (e) { log("Closing prices step skipped: " + (e.message || e)); } }
 
   // 3) insider / promoter trades: the list (≈ 6 months), then each new filing's small file
   if (left(90e3)) { const r = await nse("https://www.nseindia.com/api/corporates-pit-gg?index=equities", 60000); let list = [];

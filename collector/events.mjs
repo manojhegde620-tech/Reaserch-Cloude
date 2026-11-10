@@ -397,6 +397,7 @@ export async function runEvents(o = {}) {
     if (coDay && !full) { for (const sym of files) { if (!bcos[sym]) bcos[sym] = coOf(sym, null); if (Object.keys(bcos).length >= 1000) await flush(); } await flush(); }
     if (okAll) { if (full) ix.annV = ANN_V; if (full || coDay) ix.annCo = today; dirty = true; }
     log(`Events: ${annSent} events sent to the Announcements tab${full ? " (whole history)" : ""}${okAll ? "" : " — some could not be sent, tried again next run"}.`);
+    if (okAll) { try { await F(`${server}/api/ann`, { method: "POST", headers: { "x-trex-key": key, "content-type": "application/json" }, body: JSON.stringify({ action: "seen" }), signal: AbortSignal.timeout(30000) }); } catch (e) {} }   // the tab shows "checked … ago" even when nothing new was found
   }
   await publish(`events: ${nKept} kept`);
   log(`Events: ${nRows} filings looked at, ${nCand} possible events, ${nRead} read by AI, ${nKept} important ones kept · ${daysDone} days finished, ${left} to go · this month ≈ $${ix.monthSpent.toFixed(2)} of $${monthCap}.`);

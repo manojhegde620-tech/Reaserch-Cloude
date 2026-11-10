@@ -36,6 +36,25 @@ export function pickDocs(sym, ann, ars, nTr = 1) {
   return out.filter(d => d.doc);
 }
 
+// SECOND READING (midcaps and smallcaps, Nov 2026): more of each company's own documents, only those from 2025 on — up to 4
+// earnings-call transcripts, 2 investor presentations and the annual reports for 2024-25 and 2025-26. Documents already
+// read are never read again (only the new ones cost anything).
+export const DEEP2_SINCE = "2025-01-01";
+const annDay = r => { const t = Date.parse(String(r.an_dt || r.sort_date || "").slice(0, 11).replace(/-/g, " ") + " UTC"); return isNaN(t) ? 0 : t; };
+export function pickDocs2(sym, ann, ars, since = DEEP2_SINCE) {
+  const t0 = Date.parse(since + "T00:00:00Z");
+  const txt = r => `${r.desc || ""} ${r.attchmntText || ""} ${r.attchmntFile || ""}`, pdf = r => /\.pdf$/i.test(String(r.attchmntFile || ""));
+  const mk = type => r => ({ symbol: sym, name: r.sm_name || sym, doc: r.attchmntFile, type, date: String(r.an_dt || r.sort_date || "").slice(0, 11) });
+  const recent = ann.filter(r => pdf(r) && annDay(r) >= t0), uniq = (r, i, arr) => arr.findIndex(x => x.attchmntFile === r.attchmntFile) === i;
+  const out = [
+    ...recent.filter(r => /transcript/i.test(txt(r)) && !/investor presentation/i.test(String(r.desc || ""))).filter(uniq).slice(0, 4).map(mk("Earnings call transcript")),
+    ...recent.filter(r => /investor presentation/i.test(String(r.desc || ""))).filter(uniq).slice(0, 2).map(mk("Investor presentation")),
+    ...ars.filter(r => /\.pdf$/i.test(String(r.fileName || "")) && +r.toYr >= 2025).filter((r, i, arr) => arr.findIndex(x => x.fileName === r.fileName) === i).slice(0, 2)
+      .map(r => ({ symbol: sym, name: r.companyName || sym, doc: r.fileName, type: `Annual report ${r.fromYr || ""}-${r.toYr || ""}`, date: String(r.broadcast_dttm || "").slice(0, 11) })),
+  ];
+  return out.filter(d => d.doc);
+}
+
 // red flags and notable events from the company's own NSE announcements (no AI: the announcement subject decides)
 const FLAG_RULES = [
   ["red", "Auditor resigned", /auditor/i, /resign|cessation|withdraw/i],
@@ -143,7 +162,7 @@ export async function runDeep(o = {}) {
   const nseG = async url => { await gate(); return nseJson(url); };
   const deepTr = o.deepTranscripts || 4, deepN = o.deepCount || 300;      // big companies + your watchlist: 4 transcripts (for promises vs delivery), others: 2
   const order = new Map(tg.symbols.map((x, i) => [x, i]));
-  async function readDoc(sym, co, d) {
+  async function readDoc(sym, co, d, mult) {
     const id = ++dn;
     const mark = (s, note, extra = {}) => { const tries = ((ix.docs[d.doc] || {}).n || 0) + (s === 0 && !extra.transient ? 1 : 0); ix.docs[d.doc] = { s: s === 0 && tries >= 3 ? 2 : s, n: tries, v: DEEP_VERSION };
       co.docs = co.docs.filter(x => x.doc !== d.doc); co.docs.push({ doc: d.doc, symbol: sym, type: d.type, date: d.date, status: ix.docs[d.doc].s, model: extra.model || "", n: extra.n || 0, note, t: Date.now(), source: "deep" }); };
@@ -154,7 +173,7 @@ export async function runDeep(o = {}) {
     if (pages.join("").replace(/\s/g, "").length < 120) { mark(2, "no text in PDF (scanned images)"); return; }
     if (!/presentation|annual report/i.test(d.type) && pages.filter(p => p.trim().length > 200).length <= 2 && pages.join("").length < 5000) { mark(1, "covering letter only — the document itself is on the company's website"); return; }
     let pagesRaw = null; if (pdfText === pdfTextPoppler) { try { pagesRaw = await pdfTextPoppler(r.body, false); } catch (e) {} }
-    const sel = selectPages(pages, Math.round(budgetFor(d.type) * 1.5)); if (!sel.length) { mark(1, "no business pages found"); return; }
+    const sel = selectPages(pages, Math.round(budgetFor(d.type) * (mult || 1.5)));     // second reading: more pages per document if (!sel.length) { mark(1, "no business pages found"); return; }
     const { system, prompt } = buildPrompt(d.name, sym, d.type, d.date, sel, { ext: true });
     let ans; const tA = Date.now();
     try { ans = await askClaude(F, ckey, system, prompt, m => dlog(id, m.trim()), st); }
@@ -239,7 +258,7 @@ export async function runDeep(o = {}) {
     await judgeCo(sym, co);
     await tidyCo(sym, co);
     const pending = co.docs.some(x => x.status === 0) || list.some(d => !ix.docs[d.doc]);     // a document to retry / not reached → back next run
-    ix.companies[sym] = { t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10), ripe: ripeCount(co), jt: co.jt || 0, tv: co.tv || 0, tdt: co.tdt || 0 };
+    ix.companies[sym] = { ...(ix.companies[sym] && ix.companies[sym].v2 ? { v2: ix.companies[sym].v2 } : {}), t: pending ? 0 : Date.now(), v: DEEP_VERSION, docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length, flags: (co.flags || []).filter(f => f.lvl === "red").length, n: String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10), ripe: ripeCount(co), jt: co.jt || 0, tv: co.tv || 0, tdt: co.tdt || 0 };
     await saveCo(sym, co); cos++; sinceSave++;
     ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
     if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
@@ -265,6 +284,41 @@ export async function runDeep(o = {}) {
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);
   const worker = async () => { while (!stopRun && Date.now() < until - 120000 && docs < maxDocs) { const sym = tg.symbols[next++]; if (sym === undefined) break; try { await processCo(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
   await Promise.all(Array.from({ length: par }, worker));
+  // SECOND READING of midcaps and smallcaps (SEBI ranks by market value, default 101–1000), largest first, with its own budget
+  const cap2 = +(o.budget2Usd ?? process.env.TREX_DEEP2_BUDGET_USD ?? 0); let d2 = { left: 0, done: 0, docs: 0, total: 0, hit: false };
+  if (cap2 > 0 && !stopRun && !ix.keyDead && Date.now() < until - 120000) {
+    const [rf, rt] = String(o.ranks2 || process.env.TREX_DEEP2_RANKS || "101-1000").split("-").map(Number);
+    const t2 = await F(`${server}/api/collect?action=deeptargets2&from=${rf || 101}&to=${rt || 1000}`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }).then(r => r.json()).catch(() => null);
+    const list2 = (t2 && t2.ok && Array.isArray(t2.symbols)) ? t2.symbols : [];
+    const base2 = ix.v2spent || 0, c0 = claudeCost(st), spent2 = () => +(base2 + claudeCost(st) - c0).toFixed(4);
+    const to2 = new Date(), from2b = new Date(DEEP2_SINCE + "T00:00:00Z");
+    async function processCo2(sym) {
+      const c = ix.companies[sym]; if (c && c.v2) return;
+      if (spent2() >= cap2) { d2.hit = true; return; }
+      const a = await nseG(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from2b)}&to_date=${dmy(to2)}`);
+      const ar = await nseG(`https://www.nseindia.com/api/annual-reports?index=equities&symbol=${encodeURIComponent(sym)}`);
+      if (a.code !== 200 && ar.code !== 200) { blocked++; if (blocked >= 5) { log("Deep reading: NSE keeps refusing — stopping for this run."); stopRun = true; return; } await sleep(15000 * blocked); await session(); return; }
+      blocked = 0;
+      const ann = a.j ? (Array.isArray(a.j) ? a.j : (a.j.data || [])) : []; const ars = ar.j ? (ar.j.data || []) : [];
+      const list = pickDocs2(sym, ann, ars).filter(d => { const x = ix.docs[d.doc]; return !(x && (x.s === 2 || (x.s === 1 && x.v >= DEEP_VERSION))); });
+      const co = await loadCo(sym); let read = 0;
+      for (const d of list) { if (stopRun || Date.now() > until - 120000 || docs >= maxDocs) break; if (spent2() >= cap2) { d2.hit = true; break; } await readDoc(sym, co, d, 2); read++; }
+      if (read) { co.name = (list[0] && list[0].name) || co.name || sym; await judgeCo(sym, co); await tidyCo(sym, co); }
+      const pending = list.some(d => !ix.docs[d.doc] || ix.docs[d.doc].s === 0);
+      const prev = ix.companies[sym] || {};
+      ix.companies[sym] = { ...prev, v2: pending ? 0 : Date.now(), docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length,
+        n: prev.n || String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10), ripe: ripeCount(co), jt: co.jt || prev.jt || 0, tv: co.tv || prev.tv || 0, tdt: co.tdt || prev.tdt || 0 };
+      if (read) await saveCo(sym, co);
+      d2.docs += read; if (!pending) d2.done++;
+      ix.v2spent = spent2(); ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
+      if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
+      if (++sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); await publish(`second reading: ${list2.filter(s => ix.companies[s] && ix.companies[s].v2).length} of ${list2.length} companies`); }
+    }
+    let n2 = 0; const w2 = async () => { while (!stopRun && !d2.hit && Date.now() < until - 120000 && docs < maxDocs) { const sym = list2[n2++]; if (sym === undefined) break; try { await processCo2(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
+    await Promise.all(Array.from({ length: par }, w2));
+    ix.v2spent = spent2(); d2.total = list2.length; d2.left = list2.filter(s => !(ix.companies[s] && ix.companies[s].v2)).length;
+    log(`Second reading (midcaps and smallcaps, ranks ${rf}–${rt}): ${d2.docs} new documents this run · ${d2.total - d2.left} of ${d2.total} companies done · $${ix.v2spent.toFixed(2)} of $${cap2} used${d2.hit || ix.v2spent >= cap2 ? " — budget reached, stopping" : ""}.`);
+  }
   if (ix.keyDead) { ix.spent = +(spent0 + claudeCost(st)).toFixed(4); await publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
   ix.inTok = (ix.inTok || 0) + st.inTok; ix.outTok = (ix.outTok || 0) + st.outTok; ix.t = Date.now();
   await publish(`deep reading: ${Object.keys(ix.companies).length} companies`);
@@ -275,7 +329,8 @@ export async function runDeep(o = {}) {
   // them — otherwise the hourly timer retries them, instead of a run every 15 minutes that changes nothing.
   const unread = tg.symbols.filter(s => !ix.companies[s]).length;
   const halfDone = tg.symbols.filter(s => { const c = ix.companies[s]; return c && !(c.v >= DEEP_VERSION && c.t); }).length;
-  if (!o.skipGit && !ix.keyDead && ix.spent < cap && deepMore({ unread, halfDone, docs, tidyLeft, tidyDone })) {
+  const more2 = cap2 > 0 && d2.left > 0 && !d2.hit && (ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0);
+  if (!o.skipGit && !ix.keyDead && ix.spent < cap && (deepMore({ unread, halfDone, docs, tidyLeft, tidyDone }) || more2)) {
     // GitHub's hourly timer is unreliable for this repository, so each run starts the next one; a run that got nothing done
     // (NSE refusing, Claude busy) asks the workflow to wait 15 minutes first
     try { writeFileSync(join(tmpdir(), "trex-deep-more"), "1"); if (docs === 0 && !tidyDone) writeFileSync(join(tmpdir(), "trex-deep-wait"), "1"); } catch (e) {} }

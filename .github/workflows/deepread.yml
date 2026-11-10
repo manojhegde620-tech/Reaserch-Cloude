@@ -2,7 +2,7 @@
 # Reads each company's latest annual report, investor presentation and earnings-call transcript once, checks every number
 # and quote on its page, and saves one file per company in the "deep-data" branch (shown in the app's Business · AI tab).
 # Stops by itself when every company is done, when the key ends, or when TREX_CLAUDE_BUDGET_USD is spent.
-name: T-Rex deep reading (Claude)
+name: T-Rex deep reading
 on:
   schedule:
     - cron: "53 * * * *"        # every hour (UTC); each run reads for ~45 min, then the next one carries on

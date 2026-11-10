@@ -56,31 +56,96 @@ export function pickDocs2(sym, ann, ars, since = DEEP2_SINCE) {
 }
 
 // red flags and notable events from the company's own NSE announcements (no AI: the announcement subject decides)
+// v2 (10 Nov 2026): routine filings were being shown as red flags — a merger scheme sanctioned by the NCLT, a quarterly
+// results filing ("year ended … attached" matched an Enforcement-Directorate rule), merger hearings and creditors'
+// meetings, and the head of INTERNAL audit leaving (shown as "Auditor resigned"). Those are no longer flags.
+export const FLAG_VERSION = 2;
+const ROUTINE = /scheme of (amalgamation|arrangement)|amalgamation|demerger|\bmerger\b|first motion|second motion|meetings? of (the )?(equity )?(shareholders|creditors|unsecured creditors|secured creditors)|newspaper (publication|advertisement)|financial results|integrated filing|outcome of (the )?board meeting|trading window|investor (meet|presentation)|analyst/i;
 const FLAG_RULES = [
-  ["red", "Auditor resigned", /auditor/i, /resign|cessation|withdraw/i],
-  ["red", "Key person resigned", /\b(cfo|chief financial|ceo|chief executive|managing director|whole[- ]?time director|company secretary|compliance officer|key managerial|kmp)\b/i, /resign|cessation/i],
-  ["red", "Rating downgrade / negative watch", /rating/i, /downgrad|negative (outlook|watch)|watch with negative|withdraw|suspend|default/i],
-  ["red", "Default / delay in payment", /default|delay in (payment|servicing)|non[- ]payment|overdue/i, null],
-  ["red", "Regulatory / legal action", /penalt|show cause|tax demand|demand notice|search (and|&) seizure|\braid\b|fraud|insolvency|\bnclt\b|\bcirp\b|forensic|adjudication|sebi order|ed\b.*attach/i, null],
-  ["amber", "Promoter pledge / encumbrance", /pledge|encumbr/i, null],
-  ["amber", "Director resigned", /director/i, /resign|cessation/i],
-  ["green", "Rating upgrade", /rating/i, /upgrad|positive outlook/i],
-  ["green", "Buyback / bonus / split", /buy ?back|bonus|split|sub-division/i, null],
-  ["green", "Order / contract won", /order|contract|letter of award|\bloa\b|work order/i, /receiv|win|won|bag|secur|award/i],
-  ["green", "Capacity / plant commissioned", /commission|commercial production|capacity expansion|new plant/i, null],
-  ["info", "Acquisition / merger / fund raise", /acquisi|amalgamat|merger|scheme of arrangement|preferential|\bqip\b|rights issue|fund raising/i, null],
+  ["red", "Auditor resigned", /\b(statutory|secretarial|cost|joint statutory)?\s*auditors?\b/i, /resign|cessation|withdraw/i, /internal audit|head of (internal )?audit|audit committee/i],
+  ["red", "Key person resigned", /\b(cfo|chief financial|ceo|chief executive|managing director|whole[- ]?time director|company secretary|compliance officer|key managerial|kmp)\b/i, /resign|cessation/i, null],
+  ["red", "Rating downgrade / negative watch", /rating/i, /downgrad|negative (outlook|watch)|watch with negative|withdraw|suspend|default/i, null],
+  ["red", "Default / delay in payment", /default|delay in (payment|servicing)|non[- ]payment|overdue/i, null, ROUTINE],
+  ["red", "Regulatory / legal action", /penalt|show cause|tax demand|demand notice|search (and|&) seizure|\braid\b|fraud|insolvency|\bcirp\b|forensic|adjudication|sebi order|enforcement directorate/i, null, ROUTINE],
+  ["amber", "Promoter pledge / encumbrance", /pledge|encumbr/i, null, null],
+  ["amber", "Director resigned", /director/i, /resign|cessation/i, null],
+  ["green", "Rating upgrade", /rating/i, /upgrad|positive outlook/i, null],
+  ["green", "Buyback / bonus / split", /buy ?back|bonus|split|sub-division/i, null, null],
+  ["green", "Order / contract won", /order|contract|letter of award|\bloa\b|work order/i, /receiv|win|won|bag|secur|award/i, null],
+  ["green", "Capacity / plant commissioned", /commission|commercial production|capacity expansion|new plant/i, null, null],
+  ["info", "Acquisition / merger / fund raise", /acquisi|amalgamat|merger|scheme of arrangement|preferential|\bqip\b|rights issue|fund raising/i, null, null],
 ];
+// the rules before 10 Nov 2026 — only to recognise flags that were raised by mistake (see recheckFlags)
+const OLD_RULES = [["Auditor resigned", /auditor/i, /resign|cessation|withdraw/i], ["Default / delay in payment", /default|delay in (payment|servicing)|non[- ]payment|overdue/i, null],
+  ["Regulatory / legal action", /penalt|show cause|tax demand|demand notice|search (and|&) seizure|\braid\b|fraud|insolvency|\bnclt\b|\bcirp\b|forensic|adjudication|sebi order|ed\b.*attach/i, null]];
+export function flagOf(txt) {
+  for (const [lvl, label, a, b, not] of FLAG_RULES) { if (!a.test(txt) || (b && !b.test(txt)) || (not && not.test(txt))) continue; return { lvl, label }; }
+  return null;
+}
 export function deepSignals(ann) {
   const flags = [], seen = new Set();
   for (const r of ann || []) {
     const txt = `${r.desc || ""} ${r.attchmntText || ""}`.replace(/\s+/g, " ").trim(); if (!txt) continue;
-    for (const [lvl, label, a, b] of FLAG_RULES) {
-      if (!a.test(txt) || (b && !b.test(txt))) continue;
-      const k = label + "|" + String(r.an_dt || r.sort_date || "").slice(0, 11); if (seen.has(k)) break; seen.add(k);
-      flags.push({ lvl, label, date: String(r.an_dt || r.sort_date || "").slice(0, 11), text: txt.slice(0, 220), url: r.attchmntFile || "" }); break;
-    }
+    const f = flagOf(txt); if (!f) continue;
+    const k = f.label + "|" + String(r.an_dt || r.sort_date || "").slice(0, 11); if (seen.has(k)) continue; seen.add(k);
+    flags.push({ lvl: f.lvl, label: f.label, date: String(r.an_dt || r.sort_date || "").slice(0, 11), text: txt.slice(0, 220), url: r.attchmntFile || "" });
   }
   return flags.slice(0, 40);
+}
+// saved flags, checked again with the new rules from their saved text (no NSE call, no AI). A flag the old rules raised on
+// that same text and the new rules do not is dropped; a flag whose reason lies beyond the saved text is kept as it was.
+export function recheckFlags(flags) {
+  const out = [];
+  for (const f of flags || []) {
+    if (f.lvl !== "red") { out.push(f); continue; }
+    const n = flagOf(f.text || "");
+    if (n) { out.push({ ...f, lvl: n.lvl, label: n.label }); continue; }
+    const old = OLD_RULES.find(([label, a, b]) => label === f.label && a.test(f.text || "") && (!b || b.test(f.text || "")));
+    if (!old && f.label !== "Auditor resigned") out.push(f);          // the old reason is not in the saved text: keep
+  }
+  return out;
+}
+
+// FACT FINDER summary of one company (Nov 2026): the few facts the fact-finder screen filters on, each with the document
+// and page it comes from (the app opens the company file for the exact sentence). Only documents dated from 2025.
+export const SC_VERSION = 1;
+const SINCE25 = Date.UTC(2025, 0, 1);
+const dayOf = s => { const t = Date.parse(String(s || "").slice(0, 11).replace(/-/g, " ") + " UTC"); return isNaN(t) ? 0 : t; };
+export function toCr(v, u) {
+  const x = +v, t = String(u || "").toLowerCase(); if (!isFinite(x) || x <= 0) return null;
+  if (/usd|us\$|\$|eur|€|gbp|£/.test(t)) return null;                       // foreign currency: not converted
+  if (/crore|\bcr\b|\bcrs?\b|cr\.?$/.test(t)) return x; if (/lakh|\blac/.test(t)) return x / 100;
+  if (/billion|\bbn\b/.test(t)) return x * 100; if (/million|\bmn\b/.test(t)) return x / 10; return null;
+}
+const OB_TOTAL = /^(the )?(total |consolidated |overall |current |outstanding |unexecuted |net |closing |company'?s )?(order ?book|orders? (in hand|on hand)|(order )?backlog|unexecuted orders?)( (stands|position|size|value|level))?$/i;
+const OB_NOT = /\bnew\b|inflow|booked|received|added|\bl1\b|\bbid|pipeline|enquir|prospect|potential|expected|once|target|guidance|aspir|segment|division|domestic|export|international/i;
+export function screenOf(co, rank, now = Date.now()) {
+  const docs = Object.fromEntries((co.docs || []).map(d => [d.doc, d])), dd = f => dayOf((docs[f.doc] || {}).date);
+  const facts = (co.facts || []).filter(f => dd(f) >= SINCE25);
+  const newest = list => { const m = Math.max(0, ...list.map(dd)); return list.filter(f => dd(f) === m); };
+  const ref = f => ({ doc: f.doc, pg: f.page, dt: (docs[f.doc] || {}).date || "", as: String(f.period || "").slice(0, 40) });
+  // order book: a company-wide figure from its newest document (never a division, a bid or a pipeline)
+  const obs = facts.filter(f => f.metric === "order_book" && OB_TOTAL.test(String(f.item || "").trim()) && !OB_NOT.test(`${f.item} ${f.period}`) && toCr(f.value, f.unit));
+  const ob1 = newest(obs).sort((a, b) => toCr(b.value, b.unit) - toCr(a.value, a.unit))[0];
+  const pct = f => /%|per ?cent/i.test(String(f.unit || "")) && +f.value > 0 && +f.value <= 100;
+  const ex1 = newest(facts.filter(f => f.metric === "export_share" && pct(f) && !/segment|division/i.test(f.item))).sort((a, b) => b.value - a.value)[0];
+  const cc1 = newest(facts.filter(f => f.metric === "customer_share" && pct(f) && /\btop\b|largest|single|one customer|biggest/i.test(f.item))).sort((a, b) => b.value - a.value)[0];
+  // new capacity / projects the company said would be ready in the next 12 months
+  const cap = (co.commitments || []).filter(c => /capacity|commissioning/.test(c.kind) && dayOf(c.date) >= SINCE25)
+    .map(c => ({ c, due: dueOf(c.by) })).filter(x => x.due && x.due > now - 30 * 864e5 && x.due <= now + 366 * 864e5)
+    .sort((a, b) => a.due - b.due).filter((x, i, arr) => arr.findIndex(y => String(y.c.what).toLowerCase() === String(x.c.what).toLowerCase()) === i).slice(0, 3)
+    .map(x => ({ w: String(x.c.what || "").slice(0, 90), due: x.due, by: String(x.c.by || "").slice(0, 30), doc: x.c.doc, pg: x.c.page, dt: x.c.date || "" }));
+  const cm = co.commitments || [], vc = v => cm.filter(c => c.verdict && c.verdict.s === v).length;
+  const ins = co.insider && co.insider.promoters; const h = (co.holding || []).slice().sort((a, b) => dayOf(b.d) - dayOf(a.d));
+  const h0 = h[0], h1 = h0 ? h.find(x => dayOf(x.d) <= dayOf(h0.d) - 330 * 864e5) : null;
+  const serious = /^(Auditor resigned|Rating downgrade|Default|Regulatory)/;
+  const fl = (co.flags || []).filter(f => f.lvl === "red" && serious.test(f.label) && dayOf(f.date) > now - 366 * 864e5).slice(0, 4).map(f => ({ l: f.label, d: f.date, u: f.url || "" }));
+  return { r: rank || null, n: String(co.name || co.symbol || "").slice(0, 70), tg: (co.tags || []).slice(0, 3),
+    ob: ob1 ? { v: Math.round(toCr(ob1.value, ob1.unit)), ...ref(ob1) } : null,
+    ex: ex1 ? { v: +ex1.value, ...ref(ex1) } : null, cc: cc1 ? { v: +cc1.value, i: String(cc1.item || "").slice(0, 60), ...ref(cc1) } : null,
+    cap, pd: [vc("delivered"), vc("partly"), vc("missed"), cm.filter(c => !c.verdict || c.verdict.s === "unclear").length],
+    pb: ins ? Math.round(((ins.buy || 0) - (ins.sell || 0)) / 1e5) / 100 : null,                   // ₹ crore, promoters' net buying in the market (12 months)
+    hp: h0 ? [h0.p, h1 ? h1.p : null] : null, fl, nd: (co.docs || []).filter(d => d.status === 1).length, nf: (co.facts || []).length };
 }
 
 export async function runDeep(o = {}) {
@@ -109,7 +174,9 @@ export async function runDeep(o = {}) {
   if (ix.spent >= cap) { log(`Deep reading: the budget of $${cap} is used ($${ix.spent.toFixed(2)}) — stopping.`); return { ok: true, done: true }; }
   if (ix.keyDead && Date.now() - ix.keyDead < 12 * 3600e3) { log("Deep reading: the Claude key stopped working recently — trying again later."); return { ok: true }; }
   let dirty = false;
-  const saveCo = async (sym, co) => { writeFileSync(join(dir, "d", sym + ".json"), await sealText(co)); dirty = true; };   // sealed when DATA_KEY is set
+  const rankMap = new Map();                                        // company size rank (1 = largest), for the fact finder
+  const saveCo = async (sym, co) => { writeFileSync(join(dir, "d", sym + ".json"), await sealText(co)); dirty = true;   // sealed when DATA_KEY is set
+    const c = ix.companies[sym]; if (c) { try { c.sc = screenOf(co, rankMap.get(sym)); c.scv = SC_VERSION; c.fv = FLAG_VERSION; } catch (e) {} } };
   const loadCo = async sym => { try { const o = await openText(readFileSync(join(dir, "d", sym + ".json"), "utf8")); if (o) return o; } catch (e) {} return { symbol: sym, docs: [], facts: [] }; };
   if (sealOn()) { try { const n = await sealTree(join(dir, "d")); if (n) { dirty = true; log(`Deep reading: ${n} older files sealed (encrypted).`); } } catch (e) {} }
   const publish = async (msg) => {
@@ -117,6 +184,9 @@ export async function runDeep(o = {}) {
     // small index for the app's peer comparison: company name, product tags, competitors named in its documents
     const pe = {}; for (const [k, v] of Object.entries(ix.companies || {})) if (v && (v.tg || v.n)) pe[k] = [v.n || "", v.tg || [], v.cp || []];
     writeFileSync(join(dir, "d", "peers.json"), await sealText(pe));
+    // fact finder: one small summary per company ranked 1–1000 by market value (the app filters and sorts these)
+    const sc = {}; for (const [k, v] of Object.entries(ix.companies || {})) if (v && v.sc && v.sc.r && v.sc.r <= 1000) sc[k] = v.sc;
+    writeFileSync(join(dir, "d", "screen.json"), await sealText({ v: SC_VERSION, t: Date.now(), rows: sc }));
     if (o.skipGit || !dirty) return; dirty = false;
     try { git("add", "-A"); git("commit", "--quiet", "-m", msg); git("push", "--quiet", "origin", "HEAD:" + BRANCH); log("Deep reading: saved to GitHub (" + msg + ")."); }
     catch (e) { log("Deep reading: could not save to GitHub: " + String((e.stderr && e.stderr.toString()) || e.message || e).replace(/x-access-token:[^@]+@/g, "x-access-token:***@").slice(0, 200)); }
@@ -124,6 +194,23 @@ export async function runDeep(o = {}) {
   // 2) companies, big ones first
   const tg = await F(`${server}/api/collect?action=deeptargets`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
   if (!tg || !tg.ok) { log("Deep reading: T-Rex problem: " + (tg && tg.error)); return { ok: false }; }
+  // ranks by market value + one pass over the saved companies: red flags checked again with the new rules, fact-finder
+  // summaries built (no NSE call, no AI — only the saved files)
+  { const rk = await F(`${server}/api/collect?action=deeptargets2&from=1&to=5000`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }).then(r => r.json()).catch(() => null);
+    if (rk && rk.ok && Array.isArray(rk.symbols)) rk.symbols.forEach((x, i) => rankMap.set(x, i + 1));
+    let nf = 0, ns = 0;
+    for (const [sym, c] of Object.entries(ix.companies)) {
+      if (!c || !c.t) continue;
+      const needF = c.fv !== FLAG_VERSION, needS = c.scv !== SC_VERSION || (rankMap.size && (!c.sc || c.sc.r !== (rankMap.get(sym) || null)));
+      if (!needF && !needS) continue;
+      if (!needF && c.sc) { c.sc.r = rankMap.get(sym) || null; ns++; continue; }         // only the rank moved
+      const co = await loadCo(sym); if (!co || !co.docs) continue;
+      if (needF) { const before = JSON.stringify(co.flags || []); co.flags = recheckFlags(co.flags || []); if (JSON.stringify(co.flags) !== before) { writeFileSync(join(dir, "d", sym + ".json"), await sealText(co)); dirty = true; nf++; }
+        c.flags = (co.flags || []).filter(f => f.lvl === "red").length; c.fv = FLAG_VERSION; }
+      try { c.sc = screenOf(co, rankMap.get(sym)); c.scv = SC_VERSION; ns++; } catch (e) {}
+    }
+    if (ns) dirty = true;
+    if (nf || ns) log(`Deep reading: red flags re-checked (${nf} companies corrected), fact-finder summaries for ${ns} companies.`); }
   // NSE with a cookie session (like a browser); PDFs with curl (steadiest with NSE's archive)
   const jar = new Map();
   const keep = r => { const sc = r.headers.getSetCookie ? r.headers.getSetCookie() : []; for (const c of sc) { const [kv] = c.split(";"); const i = kv.indexOf("="); if (i > 0) jar.set(kv.slice(0, i).trim(), kv.slice(i + 1).trim()); } };

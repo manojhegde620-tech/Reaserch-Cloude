@@ -33,7 +33,9 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TREX_DEEP_MINUTES: "45"
           TREX_DEEP_PARALLEL: "6"         # companies read at the same time
-          TREX_CLAUDE_BUDGET_USD: "150"   # never spend more than this in total (the Ultra plan includes $200 of API credit a month)
+          TREX_CLAUDE_BUDGET_USD: "155"   # never spend more than this in total (the Ultra plan includes $200 of API credit a month)
+          TREX_DEEP2_BUDGET_USD: "75"     # second reading of midcaps + smallcaps (Nov 2026): never more than this
+          TREX_DEEP2_RANKS: "101-1000"    # SEBI-style rank by market value: 101-250 midcaps, 251-1000 smallcaps
           TREX_PUBLIC_LOG: "1"
       - name: Start the next run if companies remain
         if: always()

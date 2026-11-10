@@ -10,7 +10,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, parseExtras, pdfTextPoppler, askClaude, claudeCost, READER_VERSION } from "./insights.mjs";
+import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, parseExtras, pdfTextPoppler, askClaude, claudeCost, claudeModels, READER_VERSION } from "./insights.mjs";
 import { shpPledge, xbrlNum } from "./companyinfo.mjs";
 import { evaluatePromises, dueOf, JUDGE_RULES } from "./promises.mjs";
 import { tidyCompany, TIDY_VERSION } from "./tidy.mjs";
@@ -318,6 +318,64 @@ export async function runDeep(o = {}) {
     await Promise.all(Array.from({ length: par }, w2));
     ix.v2spent = spent2(); d2.total = list2.length; d2.left = list2.filter(s => !(ix.companies[s] && ix.companies[s].v2)).length;
     log(`Second reading (midcaps and smallcaps, ranks ${rf}–${rt}): ${d2.docs} new documents this run · ${d2.total - d2.left} of ${d2.total} companies done · $${ix.v2spent.toFixed(2)} of $${cap2} used${d2.hit || ix.v2spent >= cap2 ? " — budget reached, stopping" : ""}.`);
+    // ACCURACY CHECK (after the second reading, in the time left): a stronger model re-reads the page of up to 8 numbers per
+    // company (smallcaps first) and says whether each number really belongs to that item, period and unit. A number shown
+    // to be wrong is taken out of the company file (kept in "dropped" with the reason); right ones are marked checked.
+    const cap3 = +(o.checkUsd ?? process.env.TREX_DEEP_CHECK_BUDGET_USD ?? 0);
+    if (cap3 > 0 && !stopRun && !ix.keyDead && (d2.left === 0 || d2.hit || (ix.v2spent || 0) >= cap2) && Date.now() < until - 120000) {
+      await claudeModels(F, ckey, st); const ids = st.modelList || [];
+      const ver = id => parseFloat((String(id).match(/(\d+)[-.](\d+)/) || [0, 0, 0]).slice(1).join(".")) || 0;
+      const strong = (o.checkModel ? [o.checkModel] : ids.filter(id => /sonnet/i.test(id)).sort((x, y) => ver(y) - ver(x))).slice(0, 1);
+      const ck = ix.ck = ix.ck || { n: 0, ok: 0, bad: 0, unclear: 0, spent: 0 };
+      if (!strong.length) log("Accuracy check: no stronger model available for this key — skipped.");
+      else {
+        const st3 = { models: strong }; const base3 = ck.spent || 0, spent3 = () => +(base3 + claudeCost(st3)).toFixed(4);
+        const rankOf = new Map(list2.map((x, i) => [x, i + (rf || 101)]));
+        const todo = list2.filter(x => ix.companies[x] && ix.companies[x].v2 && !ix.companies[x].ck).sort((a2, b2) => ((rankOf.get(b2) >= 251) - (rankOf.get(a2) >= 251)) || (rankOf.get(a2) - rankOf.get(b2)));
+        const pj = t => { const m = String(t || "").match(/\{[\s\S]*\}/); try { return m ? JSON.parse(m[0]) : null; } catch (e) { return null; } };
+        let c3 = 0; const t3 = { n: 0, ok: 0, bad: 0, unclear: 0 };
+        async function checkCo(sym) {
+          const co = await loadCo(sym); const since = Date.parse(DEEP2_SINCE + "T00:00:00Z");
+          const docsOk = (co.docs || []).filter(x => x.status === 1 && Date.parse(String(x.date || "").replace(/-/g, " ") + " UTC") >= since && (co.facts || []).some(f => f.doc === x.doc));
+          const d = docsOk.sort((x, y) => (co.facts.filter(f => f.doc === y.doc).length) - (co.facts.filter(f => f.doc === x.doc).length))[0];
+          if (!d) { ix.companies[sym].ck = Date.now(); return; }
+          const fs = co.facts.filter(f => f.doc === d.doc && f.value != null && !f.ck).slice(0, 8); if (!fs.length) { ix.companies[sym].ck = Date.now(); return; }
+          const r = await pdfGet(d.doc); if (r.code !== 200 || !r.body || r.body.length < 1000) return;      // could not download: next run
+          let pages = []; try { pages = await pdfText(r.body); } catch (e) { return; }
+          const pg = [...new Set(fs.map(f => f.page))].filter(n => n >= 1 && n <= pages.length).slice(0, 6);
+          const claims = fs.filter(f => pg.includes(f.page)).map((f, i) => ({ id: i + 1, f }));
+          if (!claims.length) { ix.companies[sym].ck = Date.now(); return; }
+          const system = "You check numbers that were taken from an Indian listed company's own document. Be strict and literal. Reply with JSON only.";
+          const prompt = `Company: ${co.name || sym} (NSE: ${sym}). Document: ${d.type}, dated ${d.date}.
+For each claim below, read the page it cites and answer:
+- "ok": the page clearly gives this number for this item and this period, in this unit / scale
+- "wrong": the number on the page belongs to something else (another item, another period or year, another unit, crore vs lakh vs million), or the page does not say it
+- "unclear": you cannot tell from the page
+For "wrong" add "why" (at most 20 words). Reply exactly as {"checks":[{"id":1,"verdict":"ok"},{"id":2,"verdict":"wrong","why":"…"}]}.
+
+Claims:
+${claims.map(c => `${c.id}. ${c.f.item} — ${c.f.metric}${c.f.period ? " — " + c.f.period : ""}: ${c.f.vtext || c.f.value} ${c.f.unit || ""} (page ${c.f.page})`).join("\n")}
+
+${pg.map(n => `=== PAGE ${n} ===\n${String(pages[n - 1] || "").slice(0, 6000)}`).join("\n\n")}`;
+          const before = claudeCost(st3);
+          let ans; try { ans = await askClaude(F, ckey, system, prompt, null, st3); } catch (e) { if (e.fatal || e.config) { ix.keyDead = e.fatal ? Date.now() : ix.keyDead; stopRun = true; } return; }
+          st.cost = (st.cost != null ? st.cost : claudeCost(st)) + (claudeCost(st3) - before);       // counted in the total too
+          const j = pj(ans.text); const list = (j && Array.isArray(j.checks)) ? j.checks : null; if (!list) return;
+          const drop = new Set();
+          for (const c of claims) { const v = list.find(x => +x.id === c.id); const verdict = v && String(v.verdict || "").toLowerCase(); t3.n++;
+            if (verdict === "ok") { c.f.ck = 1; t3.ok++; }
+            else if (verdict === "wrong") { drop.add(c.f); t3.bad++; co.dropped = (co.dropped || []).concat([{ ...c.f, why: String(v.why || "").slice(0, 160), t: Date.now(), by: ans.model }]).slice(-200); }
+            else t3.unclear++; }
+          if (drop.size) co.facts = co.facts.filter(f => !drop.has(f));
+          await saveCo(sym, co); ix.companies[sym].ck = Date.now(); ix.companies[sym].facts = co.facts.length; c3++;
+        }
+        let n3 = 0; const w3 = async () => { while (!stopRun && Date.now() < until - 120000 && spent3() < cap3) { const sym = todo[n3++]; if (sym === undefined) break; try { await checkCo(sym); } catch (e) {} ck.spent = spent3(); } };
+        await Promise.all(Array.from({ length: par }, w3));
+        ck.spent = spent3(); ck.n += t3.n; ck.ok += t3.ok; ck.bad += t3.bad; ck.unclear += t3.unclear; d2.ckLeft = spent3() < cap3 ? todo.length - c3 : 0; d2.ck = c3;
+        ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
+        log(`Accuracy check: ${c3} companies, ${t3.n} numbers this run (${t3.ok} right, ${t3.bad} wrong and taken out, ${t3.unclear} unclear) · total ${ck.n} checked, ${ck.bad} taken out · $${ck.spent.toFixed(2)} of $${cap3} used [${strong[0]}].`);
+      }
+    }
   }
   if (ix.keyDead) { ix.spent = +(spent0 + claudeCost(st)).toFixed(4); await publish(`stop: key not usable`); return { ok: true, keyDead: true, docs }; }
   ix.inTok = (ix.inTok || 0) + st.inTok; ix.outTok = (ix.outTok || 0) + st.outTok; ix.t = Date.now();
@@ -329,7 +387,7 @@ export async function runDeep(o = {}) {
   // them — otherwise the hourly timer retries them, instead of a run every 15 minutes that changes nothing.
   const unread = tg.symbols.filter(s => !ix.companies[s]).length;
   const halfDone = tg.symbols.filter(s => { const c = ix.companies[s]; return c && !(c.v >= DEEP_VERSION && c.t); }).length;
-  const more2 = cap2 > 0 && d2.left > 0 && !d2.hit && (ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0);
+  const more2 = (cap2 > 0 && d2.left > 0 && !d2.hit && (ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0)) || ((d2.ckLeft || 0) > 0 && (d2.ck || 0) > 0);
   if (!o.skipGit && !ix.keyDead && ix.spent < cap && (deepMore({ unread, halfDone, docs, tidyLeft, tidyDone }) || more2)) {
     // GitHub's hourly timer is unreliable for this repository, so each run starts the next one; a run that got nothing done
     // (NSE refusing, Claude busy) asks the workflow to wait 15 minutes first

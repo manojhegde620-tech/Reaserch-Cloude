@@ -108,12 +108,27 @@ export function recheckFlags(flags) {
 
 // FACT FINDER summary of one company (Nov 2026): the few facts the fact-finder screen filters on, each with the document
 // and page it comes from (the app opens the company file for the exact sentence). Only documents dated from 2025.
-export const SC_VERSION = 2;
+export const SC_VERSION = 3;
 // v2 (11 Nov 2026): tax demands, GST orders, penalties and show-cause notices are routine for many companies — they are kept
 // apart as "tax / regulatory notices" (with the NSE subject); only an auditor leaving, a rating cut, a default, or fraud /
 // insolvency / raids / forensic audit / SEBI or ED orders count as serious flags.
 const GRAVE = /fraud|insolvency|\bcirp\b|forensic|search (and|&) seizure|\braid\b|enforcement directorate|sebi order|\bwilful\b/i;
 const flSubj = t => String(t || "").replace(/\s+/g, " ").trim().slice(0, 120);
+// v3 (11 Nov 2026), from the live list: a rating withdrawn or affirmed is not a downgrade; a fine, a tax / GST demand or a stay
+// order is a notice; a bank reporting a borrower's or an employee's fraud is a routine bank disclosure; buying a company out of
+// insolvency, forfeiting unpaid shares, or a results / board-meeting filing is no flag at all
+const SC_DROP = /outcome of (the )?board meeting|financial results|integrated filing|trading window|forfeit|acquisition of|\bacquir|resolution applicant|resolution plan (has been |was )?approved|successful resolution/i;
+const SC_RATING = /downgrad|negative (outlook|watch|implication)|watch with negative|\bdefault\b|suspend|not cooperating|non[- ]cooperat/i;
+const SC_NOTICE = /demand notice|tax demand|show cause|penalt|payment of fines|fines?\s*\/\s*penalt|stay order|\bgst\b/i;
+export function flKind(f, name) {                                       // "S" serious, "N" notice, "" not a flag
+  const t = String(f.text || "");
+  if (SC_DROP.test(t)) return "";
+  if (/^Rating/.test(f.label)) return SC_RATING.test(t) ? "S" : "";
+  if (/^Auditor/.test(f.label)) return "S";
+  if (/^Default/.test(f.label)) return SC_NOTICE.test(t) || (/\bbank\b/i.test(String(name || "")) && /fraud/i.test(t)) ? "N" : "S";
+  if (/^Regulatory/.test(f.label)) return GRAVE.test(t) && !(/\bbank\b/i.test(String(name || "")) && /fraud/i.test(t) && !/forensic/i.test(t)) ? "S" : "N";
+  return "";
+}
 const SINCE25 = Date.UTC(2025, 0, 1);
 const dayOf = s => { const t = Date.parse(String(s || "").slice(0, 11).replace(/-/g, " ") + " UTC"); return isNaN(t) ? 0 : t; };
 export function toCr(v, u) {
@@ -144,9 +159,8 @@ export function screenOf(co, rank, now = Date.now()) {
   const ins = co.insider && co.insider.promoters; const h = (co.holding || []).slice().sort((a, b) => dayOf(b.d) - dayOf(a.d));
   const h0 = h[0], h1 = h0 ? h.find(x => dayOf(x.d) <= dayOf(h0.d) - 330 * 864e5) : null;
   const yr = (co.flags || []).filter(f => f.lvl === "red" && dayOf(f.date) > now - 366 * 864e5);
-  const isSerious = f => /^(Auditor resigned|Rating downgrade|Default)/.test(f.label) || (/^Regulatory/.test(f.label) && GRAVE.test(f.text || ""));
-  const fl = yr.filter(isSerious).slice(0, 4).map(f => ({ l: f.label, d: f.date, u: f.url || "", t: flSubj(f.text) }));
-  const nt = yr.filter(f => /^Regulatory/.test(f.label) && !isSerious(f)).slice(0, 4).map(f => ({ d: f.date, u: f.url || "", t: flSubj(f.text) }));
+  const fl = yr.filter(f => flKind(f, co.name) === "S").slice(0, 4).map(f => ({ l: f.label, d: f.date, u: f.url || "", t: flSubj(f.text) }));
+  const nt = yr.filter(f => flKind(f, co.name) === "N").slice(0, 4).map(f => ({ d: f.date, u: f.url || "", t: flSubj(f.text) }));
   return { r: rank || null, n: String(co.name || co.symbol || "").slice(0, 70), tg: (co.tags || []).slice(0, 3),
     ob: ob1 ? { v: Math.round(toCr(ob1.value, ob1.unit)), ...ref(ob1) } : null,
     ex: ex1 ? { v: +ex1.value, ...ref(ex1) } : null, cc: cc1 ? { v: +cc1.value, i: String(cc1.item || "").slice(0, 60), ...ref(cc1) } : null,

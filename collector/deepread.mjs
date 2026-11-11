@@ -108,7 +108,12 @@ export function recheckFlags(flags) {
 
 // FACT FINDER summary of one company (Nov 2026): the few facts the fact-finder screen filters on, each with the document
 // and page it comes from (the app opens the company file for the exact sentence). Only documents dated from 2025.
-export const SC_VERSION = 1;
+export const SC_VERSION = 2;
+// v2 (11 Nov 2026): tax demands, GST orders, penalties and show-cause notices are routine for many companies — they are kept
+// apart as "tax / regulatory notices" (with the NSE subject); only an auditor leaving, a rating cut, a default, or fraud /
+// insolvency / raids / forensic audit / SEBI or ED orders count as serious flags.
+const GRAVE = /fraud|insolvency|\bcirp\b|forensic|search (and|&) seizure|\braid\b|enforcement directorate|sebi order|\bwilful\b/i;
+const flSubj = t => String(t || "").replace(/\s+/g, " ").trim().slice(0, 120);
 const SINCE25 = Date.UTC(2025, 0, 1);
 const dayOf = s => { const t = Date.parse(String(s || "").slice(0, 11).replace(/-/g, " ") + " UTC"); return isNaN(t) ? 0 : t; };
 export function toCr(v, u) {
@@ -138,14 +143,16 @@ export function screenOf(co, rank, now = Date.now()) {
   const cm = co.commitments || [], vc = v => cm.filter(c => c.verdict && c.verdict.s === v).length;
   const ins = co.insider && co.insider.promoters; const h = (co.holding || []).slice().sort((a, b) => dayOf(b.d) - dayOf(a.d));
   const h0 = h[0], h1 = h0 ? h.find(x => dayOf(x.d) <= dayOf(h0.d) - 330 * 864e5) : null;
-  const serious = /^(Auditor resigned|Rating downgrade|Default|Regulatory)/;
-  const fl = (co.flags || []).filter(f => f.lvl === "red" && serious.test(f.label) && dayOf(f.date) > now - 366 * 864e5).slice(0, 4).map(f => ({ l: f.label, d: f.date, u: f.url || "" }));
+  const yr = (co.flags || []).filter(f => f.lvl === "red" && dayOf(f.date) > now - 366 * 864e5);
+  const isSerious = f => /^(Auditor resigned|Rating downgrade|Default)/.test(f.label) || (/^Regulatory/.test(f.label) && GRAVE.test(f.text || ""));
+  const fl = yr.filter(isSerious).slice(0, 4).map(f => ({ l: f.label, d: f.date, u: f.url || "", t: flSubj(f.text) }));
+  const nt = yr.filter(f => /^Regulatory/.test(f.label) && !isSerious(f)).slice(0, 4).map(f => ({ d: f.date, u: f.url || "", t: flSubj(f.text) }));
   return { r: rank || null, n: String(co.name || co.symbol || "").slice(0, 70), tg: (co.tags || []).slice(0, 3),
     ob: ob1 ? { v: Math.round(toCr(ob1.value, ob1.unit)), ...ref(ob1) } : null,
     ex: ex1 ? { v: +ex1.value, ...ref(ex1) } : null, cc: cc1 ? { v: +cc1.value, i: String(cc1.item || "").slice(0, 60), ...ref(cc1) } : null,
     cap, pd: [vc("delivered"), vc("partly"), vc("missed"), cm.filter(c => !c.verdict || c.verdict.s === "unclear").length],
     pb: ins ? Math.round(((ins.buy || 0) - (ins.sell || 0)) / 1e5) / 100 : null,                   // ₹ crore, promoters' net buying in the market (12 months)
-    hp: h0 ? [h0.p, h1 ? h1.p : null] : null, fl, nd: (co.docs || []).filter(d => d.status === 1).length, nf: (co.facts || []).length };
+    hp: h0 ? [h0.p, h1 ? h1.p : null] : null, fl, nt, nd: (co.docs || []).filter(d => d.status === 1).length, nf: (co.facts || []).length };
 }
 
 export async function runDeep(o = {}) {

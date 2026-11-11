@@ -210,7 +210,7 @@ export async function runDeep(o = {}) {
       if (!c || !c.t) continue;
       const needF = c.fv !== FLAG_VERSION, needS = c.scv !== SC_VERSION || (rankMap.size && (!c.sc || c.sc.r !== (rankMap.get(sym) || null)));
       if (!needF && !needS) continue;
-      if (!needF && c.sc) { c.sc.r = rankMap.get(sym) || null; ns++; continue; }         // only the rank moved
+      if (!needF && c.sc && c.scv === SC_VERSION) { c.sc.r = rankMap.get(sym) || null; ns++; continue; }         // only the rank moved (a new summary version is always rebuilt)
       const co = await loadCo(sym); if (!co || !co.docs) continue;
       if (needF) { const before = JSON.stringify(co.flags || []); co.flags = recheckFlags(co.flags || []); if (JSON.stringify(co.flags) !== before) { writeFileSync(join(dir, "d", sym + ".json"), await sealText(co)); dirty = true; nf++; }
         c.flags = (co.flags || []).filter(f => f.lvl === "red").length; c.fv = FLAG_VERSION; }

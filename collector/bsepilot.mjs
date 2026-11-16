@@ -56,6 +56,22 @@ export function onPage(v, text) {
   const forms = new Set([String(a), a.toFixed(2), a.toFixed(1), a.toFixed(0)].filter(f => +f === a || Math.abs(+f - a) < 1e-9));
   return [...forms].some(f => new RegExp(`(?<![\\d.])${f.replace(".", "\\.")}(?![\\d])`).test(t));
 }
+// …and is it in the right ROW? (pilot, 16 Nov 2026: a scanned PDF gave "total income" as sales — the number was on the page,
+// but in another row). The line holding the number (or the line just above / below it, for labels that wrap) must carry the
+// row's own label.
+const ROW = { revenue: [/(revenue|income) from operation|net sales|sales|turnover/i, /total|other/i], other_income: [/other income/i], total_income: [/total (revenue|income)|total income from operation/i],
+  total_expenses: [/total expen/i], finance_costs: [/finance cost|interest/i], depreciation: [/depreciation|amorti[sz]ation/i], pbt: [/before tax/i, /exceptional items and tax|before exceptional/i],
+  tax: [/tax/i, /before tax|after tax/i], net_profit: [/profit|loss/i, /before tax|exceptional|discontinued|comprehensive|attributable/i], eps_basic: [/basic|earnings? per share|eps/i] };
+export function onRow(v, text, field) {
+  if (!onPage(v, text)) return false; const r = ROW[field]; if (!r) return true;
+  const L = String(text || "").split(/\r?\n/).map(l => l.replace(/(\d),(?=\d)/g, "$1")), a = Math.abs(+v);
+  const forms = [String(a), a.toFixed(2), a.toFixed(1), a.toFixed(0)].filter(f => Math.abs(+f - a) < 1e-9).map(f => new RegExp(`(?<![\\d.])${f.replace(".", "\\.")}(?![\\d])`));
+  const lab = l => l.replace(/[-\d.,()\s]+$/g, " ");
+  for (let i = 0; i < L.length; i++) { if (!forms.some(re => re.test(L[i]))) continue;
+    const own = lab(L[i]), ks = /[a-z]{3}/i.test(own) ? [i] : [i - 1, i + 1];        // a label of its own decides; neighbours only when it wrapped
+    for (const k of ks) { const t = lab(L[k] || ""); if (r[0].test(t) && !(r[1] && r[1].test(t))) return true; } }
+  return false;
+}
 // ₹ crore per printed unit; null when the unit is not clear (then nothing is shown)
 export function unitFactor(u) {
   const s = String(u || "").toLowerCase();
@@ -69,13 +85,14 @@ export function check(statements, pageOf) {
     s.factor = unitFactor(s.unit);
     for (const c of s.columns || []) {
       const txt = pageOf(c.page); c.onPage = {};
-      for (const f of FIELDS) { if (c[f] == null) continue; total++; c.onPage[f] = onPage(c[f], txt); if (c.onPage[f]) found++; }
+      for (const f of FIELDS) { if (c[f] == null) continue; total++; c.onPage[f] = onRow(c[f], txt, f); if (c.onPage[f]) found++; }
       const near = (x, y) => x != null && y != null && Math.abs(x - y) <= Math.max(1.5, Math.abs(y) * 0.003);
       c.sums = { income: c.total_income == null || c.revenue == null ? null : near((+c.revenue) + (+c.other_income || 0), +c.total_income),
         pbt: c.total_income == null || c.total_expenses == null || c.pbt == null ? null : near(+c.total_income - +c.total_expenses, +c.pbt),
         np: c.pbt == null || c.tax == null || c.net_profit == null ? null : near(+c.pbt - +c.tax, +c.net_profit) };
-      // shown only when sales and profit are on the page, the unit is clear and no total disagrees
-      c.ok = !!(s.factor && c.onPage.revenue && c.onPage.net_profit && c.sums.income !== false && c.sums.np !== false);
+      // shown only when sales, total income and profit are each in their own row on the page, sales + other income = total
+      // income, no other total disagrees and the unit is clear
+      c.ok = !!(s.factor && c.onPage.revenue && c.onPage.total_income && c.onPage.net_profit && c.sums.income === true && c.sums.np !== false && c.sums.pbt !== false);
     }
   }
   return { found, total };
@@ -88,8 +105,11 @@ revenue = revenue from operations (or income from operations); pbt = profit befo
 
 async function main() {
   if (!KEY || !CKEY) { log("Pilot: TREX_KEY or ANTHROPIC_API_KEY missing — nothing done."); return; }
+  // first the PDFs read by an older version of these checks (read again), then new ones
+  const re = await trex("bsepdfs", "&redo=1&n=" + N).then(r => r.json()).catch(() => ({ rows: [] }));
   const tg = await trex("bsepdfs", "&n=" + N).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
   if (!tg.ok) { log("Pilot: could not get the list from T-Rex: " + (tg.error || "?")); process.exitCode = 1; return; }
+  tg.rows = [...(re.rows || []), ...tg.rows];
   let spent = +tg.spent || 0; log(`Pilot: ${tg.rows.length} PDFs to read; spent so far $${spent.toFixed(4)} of $${CAP}.`);
   const st = {}; let k = 0;
   for (const co of tg.rows) {
@@ -112,7 +132,7 @@ async function main() {
       const ck = check(statements, pageOf);
       for (const s of statements) for (const c of s.columns || []) c.page = (pick[Math.max(0, Math.min(pick.length - 1, Math.round(+c.page || 1) - 1))] ?? 0) + 1;   // page of the original PDF
       const ok = statements.some(s => (s.columns || []).some(c => c.ok));
-      await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, model: ans.model, cost, ok, data: { via: got.via, pages: nPages, read: pick.map(p => p + 1), ocr, statements, found: ck.found, numbers: ck.total } });
+      await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, model: ans.model, cost, ok, data: { rv: 2, via: got.via, pages: nPages, read: pick.map(p => p + 1), ocr, statements, found: ck.found, numbers: ck.total } });
       log(`  ${id}: ${nPages} pages (${ocr.length ? "scanned, read by OCR" : "text"}), ${statements.length} statement(s), ${ck.found} of ${ck.total} numbers found on the page — $${cost.toFixed(4)}`);
     } catch (e) { log(`  ${id}: ${String(e.message || e).slice(0, 140)}`); if (e.fatal) break; }
     finally { await rm(dir, { recursive: true, force: true }); }

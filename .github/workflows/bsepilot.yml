@@ -1,0 +1,29 @@
+# T-Rex · $1 pilot (owner's OK, 16 Nov 2026): read the figures of 10 BSE-only companies' results PDFs and check every number
+# on its page. Runs only when started by hand. Hard cap TREX_BSEPILOT_BUDGET_USD, counted by T-Rex across all runs.
+# Figures go to T-Rex only; this public log shows no company names or numbers.
+name: T-Rex BSE-only PDF pilot
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: trex-bsepilot
+  cancel-in-progress: false
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PDF and OCR tools
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils tesseract-ocr >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext && command -v tesseract
+      - name: Read the results PDFs (hard cap $1)
+        run: node collector/bsepilot.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          TREX_BSEPILOT_BUDGET_USD: "1"
+          TREX_BSEPILOT_N: "10"

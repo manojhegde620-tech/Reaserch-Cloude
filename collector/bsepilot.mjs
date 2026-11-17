@@ -18,7 +18,8 @@ import { askClaude, pdfTextPoppler, salvageJson } from "./insights.mjs";
 
 const server = (process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
 const KEY = process.env.TREX_KEY || "", CKEY = process.env.ANTHROPIC_API_KEY || "";
-const CAP = +(process.env.TREX_BSEPILOT_BUDGET_USD || 1), N = Math.min(20, +(process.env.TREX_BSEPILOT_N || 10));
+const CAP = +(process.env.TREX_BSEPILOT_BUDGET_USD || 1), N = Math.min(80, +(process.env.TREX_BSEPILOT_N || 10));
+const MCAP = +(process.env.TREX_BSEPDF_MONTH_USD || 0);          // (17 Nov 2026, owner: read every BSE-only results PDF) cap per month; 0 = only the total cap
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const log = (...a) => console.log(...a);
 const sh = (cmd, args) => new Promise((res, rej) => execFile(cmd, args, { maxBuffer: 256 * 1024 * 1024, timeout: 180000 }, (e, out) => e ? rej(e) : res(String(out))));
@@ -110,10 +111,10 @@ async function main() {
   const tg = await trex("bsepdfs", "&n=" + N).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
   if (!tg.ok) { log("Pilot: could not get the list from T-Rex: " + (tg.error || "?")); process.exitCode = 1; return; }
   tg.rows = [...(re.rows || []), ...tg.rows];
-  let spent = +tg.spent || 0; log(`Pilot: ${tg.rows.length} PDFs to read; spent so far $${spent.toFixed(4)} of $${CAP}.`);
+  let spent = +tg.spent || 0, spentM = +tg.spentMonth || 0; log(`BSE PDFs: ${tg.rows.length} to read; spent so far $${spent.toFixed(4)} of $${CAP}${MCAP ? `, this month $${spentM.toFixed(4)} of $${MCAP}` : ""}.`);
   const st = {}; let k = 0;
   for (const co of tg.rows) {
-    k++; if (spent >= CAP - 0.05) { log(`Pilot: budget reached ($${spent.toFixed(4)}) — stopping.`); break; }
+    k++; if (spent >= CAP - 0.05 || (MCAP && spentM >= MCAP - 0.05)) { log(`BSE PDFs: budget reached ($${spent.toFixed(4)} in total, $${spentM.toFixed(4)} this month) — stopping.`); break; }
     const dir = await mkdtemp(join(tmpdir(), "bsep-")); const id = `doc ${k}`;
     try {
       const got = await getPdf(co.pdf); if (!got) { log(`  ${id}: could not download`); await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { err: "download failed" } }); continue; }
@@ -125,7 +126,7 @@ async function main() {
       const sub = join(dir, "sub.pdf"); if (parts.length > 1) await sh("pdfunite", [...parts, sub]); else await writeFile(sub, await readFile(parts[0]));
       const c0 = st.cost || 0;
       const ans = await askClaude(fetch, CKEY, SYSTEM, [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: (await readFile(sub)).toString("base64") } }, { type: "text", text: prompt(co, pick) }], null, st);
-      const cost = (st.cost || 0) - c0; spent += cost;
+      const cost = (st.cost || 0) - c0; spent += cost; spentM += cost;
       let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
       const statements = (j && Array.isArray(j.statements)) ? j.statements.slice(0, 4) : [];
       const pageOf = n => pages[pick[Math.max(0, Math.min(pick.length - 1, Math.round(+n || 1) - 1))]] || "";

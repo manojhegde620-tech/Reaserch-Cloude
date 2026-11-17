@@ -494,7 +494,10 @@ export async function runDeep(o = {}) {
     const strong = ffTodo.length && (ck.spent || 0) < capCk ? await strongModel() : null;
     if (ffTodo.length && strong) {
       const stF = { models: [strong] }, baseF = ck.spent || 0, spentF = () => +(baseF + claudeCost(stF)).toFixed(4);
-      const ffUntil = Math.min(until - 120000, Date.now() + (o.ffMinutes ?? 25) * 60e3), tF = { n: 0, ok: 0, bad: 0, unclear: 0 };
+      // time and workers: the first live run checked 38 companies in 25 minutes with 4 workers (downloads + page text + the
+      // checker's thinking) — accuracy is the owner's #1 rule, so this pass gets more of each run and more workers
+      const ffUntil = Math.min(until - 120000, Date.now() + (o.ffMinutes ?? (+process.env.TREX_FF_MINUTES || 30)) * 60e3), tF = { n: 0, ok: 0, bad: 0, unclear: 0 };
+      const parF = Math.max(1, o.ffParallel || +process.env.TREX_FF_PARALLEL || 6);
       async function ffCo(sym) {                                  // true = everything the fact finder shows for it is checked
         for (let round = 0; round < 3; round++) {
           const co = await loadCo(sym), p = ffPick(co);
@@ -526,7 +529,7 @@ export async function runDeep(o = {}) {
         return true;
       }
       let nF = 0; const wF = async () => { while (!stopRun && Date.now() < ffUntil && spentF() < capCk) { const sym = ffTodo[nF++]; if (sym === undefined) break; try { if (await ffCo(sym)) ffDone++; } catch (e) {} ck.spent = spentF(); } };
-      await Promise.all(Array.from({ length: par }, wF));
+      await Promise.all(Array.from({ length: parF }, wF));
       ck.spent = spentF(); ck.n += tF.n; ck.ok += tF.ok; ck.bad += tF.bad; ck.unclear += tF.unclear; ix.spent = +(spent0 + claudeCost(st)).toFixed(4); dirty = true;
       const left = Object.values(ix.companies).filter(ffWait).length; ffLeft = ck.spent < capCk ? left : 0;
       log(`Fact-finder check: ${ffDone} compan${ffDone === 1 ? "y" : "ies"} done, ${tF.n} items this run (${tF.ok} right, ${tF.bad} wrong and taken out, ${tF.unclear} unclear) · ${left} companies left · $${ck.spent.toFixed(2)} of $${capCk} used [${strong}].`);

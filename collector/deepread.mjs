@@ -156,11 +156,12 @@ export function toCr(v, u) {
 }
 const OB_TOTAL = /^(the )?(total |consolidated |overall |current |outstanding |unexecuted |net |closing |company'?s )?(order ?book|orders? (in hand|on hand)|(order )?backlog|unexecuted orders?)( (stands|position|size|value|level))?$/i;
 const OB_NOT = /\bnew\b|inflow|booked|received|added|\bl1\b|\bbid|pipeline|enquir|prospect|potential|expected|once|target|guidance|aspir|segment|division|domestic|export|international/i;
-export function screenOf(co, rank, now = Date.now()) {
+// what the fact finder shows for a company: the facts behind its order book, export share and top-customer share, and the
+// capacity plans due within 12 months — one place, so the summary and the fact-finder check always look at the same items
+export function ffPick(co, now = Date.now()) {
   const docs = Object.fromEntries((co.docs || []).map(d => [d.doc, d])), dd = f => dayOf((docs[f.doc] || {}).date);
   const facts = (co.facts || []).filter(f => dd(f) >= SINCE25);
   const newest = list => { const m = Math.max(0, ...list.map(dd)); return list.filter(f => dd(f) === m); };
-  const ref = f => ({ doc: f.doc, pg: f.page, dt: (docs[f.doc] || {}).date || "", as: String(f.period || "").slice(0, 40) });
   // order book: a company-wide figure from its newest document (never a division, a bid or a pipeline)
   const obs = facts.filter(f => f.metric === "order_book" && OB_TOTAL.test(String(f.item || "").trim()) && !OB_NOT.test(`${f.item} ${f.period}`) && toCr(f.value, f.unit));
   const ob1 = newest(obs).sort((a, b) => toCr(b.value, b.unit) - toCr(a.value, a.unit))[0];
@@ -170,8 +171,14 @@ export function screenOf(co, rank, now = Date.now()) {
   // new capacity / projects the company said would be ready in the next 12 months
   const cap = (co.commitments || []).filter(c => /capacity|commissioning/.test(c.kind) && dayOf(c.date) >= SINCE25)
     .map(c => ({ c, due: dueOf(c.by) })).filter(x => x.due && x.due > now - 30 * 864e5 && x.due <= now + 366 * 864e5)
-    .sort((a, b) => a.due - b.due).filter((x, i, arr) => arr.findIndex(y => String(y.c.what).toLowerCase() === String(x.c.what).toLowerCase()) === i).slice(0, 3)
-    .map(x => ({ w: String(x.c.what || "").slice(0, 90), due: x.due, by: String(x.c.by || "").slice(0, 30), doc: x.c.doc, pg: x.c.page, dt: x.c.date || "" }));
+    .sort((a, b) => a.due - b.due).filter((x, i, arr) => arr.findIndex(y => String(y.c.what).toLowerCase() === String(x.c.what).toLowerCase()) === i).slice(0, 3);
+  return { docs, ob1, ex1, cc1, cap };
+}
+export function screenOf(co, rank, now = Date.now()) {
+  const { docs, ob1, ex1, cc1, cap: cap0 } = ffPick(co, now);
+  const ref = f => ({ doc: f.doc, pg: f.page, dt: (docs[f.doc] || {}).date || "", as: String(f.period || "").slice(0, 40) });
+  const cap = cap0.map(x => ({ w: String(x.c.what || "").slice(0, 90), due: x.due, by: String(x.c.by || "").slice(0, 30), doc: x.c.doc, pg: x.c.page, dt: x.c.date || "" }));
+  const ck = [ob1, ex1, cc1, ...cap0.map(x => x.c)].every(x => !x || x.ck) ? 1 : 0;      // every number and plan shown has been re-checked
   const cm = co.commitments || [], vc = v => cm.filter(c => c.verdict && c.verdict.s === v).length;
   const ins = co.insider && co.insider.promoters; const h = (co.holding || []).slice().sort((a, b) => dayOf(b.d) - dayOf(a.d));
   const h0 = h[0], h1 = h0 ? h.find(x => dayOf(x.d) <= dayOf(h0.d) - 330 * 864e5) : null;
@@ -183,8 +190,42 @@ export function screenOf(co, rank, now = Date.now()) {
     ex: ex1 ? { v: +ex1.value, ...ref(ex1) } : null, cc: cc1 ? { v: +cc1.value, i: String(cc1.item || "").slice(0, 60), ...ref(cc1) } : null,
     cap, pd: [vc("delivered"), vc("partly"), vc("missed"), cm.filter(c => !c.verdict || c.verdict.s === "unclear").length],
     pb: ins ? Math.round(((ins.buy || 0) - (ins.sell || 0)) / 1e5) / 100 : null,                   // ₹ crore, promoters' net buying in the market (12 months)
-    hp: h0 ? [h0.p, h1 ? h1.p : null] : null, fl, nt, nd: (co.docs || []).filter(d => d.status === 1).length, nf: (co.facts || []).length };
+    hp: h0 ? [h0.p, h1 ? h1.p : null] : null, fl, nt, nd: (co.docs || []).filter(d => d.status === 1).length, nf: (co.facts || []).length, ck };
 }
+
+// THE ACCURACY CHECKER'S QUESTION: a stronger model reads the cited page and says whether each claim really belongs to that
+// item, period and unit. A PLAN claim (a capacity plan the fact finder shows) is "ok" only when the page states it with that timing.
+export const CK_SYSTEM = "You check numbers that were taken from an Indian listed company's own document. Be strict and literal. Reply with JSON only.";
+export function ckPrompt(name, sym, d, claims, pages, pg) {
+  const plan = claims.some(c => c.c);
+  return `Company: ${name || sym} (NSE: ${sym}). Document: ${d.type}, dated ${d.date}.
+For each claim below, read the page it cites and answer:
+- "ok": the page clearly gives this number for this item and this period, in this unit / scale${plan ? `
+- for a PLAN claim, "ok" means the page clearly states this plan and this timing` : ""}
+- "wrong": the number on the page belongs to something else (another item, another period or year, another unit, crore vs lakh vs million), or the page does not say it
+- "unclear": you cannot tell from the page
+For "wrong" add "why" (at most 20 words). Reply exactly as {"checks":[{"id":1,"verdict":"ok"},{"id":2,"verdict":"wrong","why":"…"}]}.
+
+Claims:
+${claims.map(c => c.f ? `${c.id}. ${c.f.item} — ${c.f.metric}${c.f.period ? " — " + c.f.period : ""}: ${c.f.vtext || c.f.value} ${c.f.unit || ""} (page ${c.f.page})` : `${c.id}. PLAN — ${c.c.what}${c.c.by ? " — by " + c.c.by : ""} (page ${c.c.page})`).join("\n")}
+
+${pg.map(n => `=== PAGE ${n} ===\n${String(pages[n - 1] || "").slice(0, 6000)}`).join("\n\n")}`;
+}
+// the verdicts: "ok" → checked (ck 1); "wrong" → taken out of the company file (kept in "dropped" with the reason);
+// "unclear" → marked (ck 2) so it is not paid for again. Returns how many were taken out.
+export function ckApply(co, claims, list, model, t) {
+  const dropF = new Set(), dropC = new Set();
+  for (const c of claims) {
+    const v = list.find(x => +x.id === c.id), verdict = v && String(v.verdict || "").toLowerCase(), o = c.f || c.c; t.n++;
+    if (verdict === "ok") { o.ck = 1; t.ok++; }
+    else if (verdict === "wrong") { (c.f ? dropF : dropC).add(o); t.bad++; co.dropped = (co.dropped || []).concat([{ ...o, ...(c.c ? { plan: 1 } : {}), why: String(v.why || "").slice(0, 160), t: Date.now(), by: model }]).slice(-200); }
+    else { if (v) o.ck = 2; t.unclear++; }
+  }
+  if (dropF.size) co.facts = (co.facts || []).filter(f => !dropF.has(f));
+  if (dropC.size) co.commitments = (co.commitments || []).filter(c => !dropC.has(c));
+  return dropF.size + dropC.size;
+}
+const ffWait = c => c && c.sc && c.sc.r && c.sc.r <= 1000 && !c.sc.ck && (c.sc.ob || c.sc.ex || c.sc.cc || (c.sc.cap || []).length) && (c.ffx || 0) < 3;
 
 export async function runDeep(o = {}) {
   const server = (o.server || process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
@@ -437,6 +478,61 @@ export async function runDeep(o = {}) {
   let next = 0; const par = Math.max(1, o.parallel || +process.env.TREX_DEEP_PARALLEL || 4);
   const worker = async () => { while (!stopRun && Date.now() < until - 120000 && docs < maxDocs) { const sym = tg.symbols[next++]; if (sym === undefined) break; try { await processCo(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
   await Promise.all(Array.from({ length: par }, worker));
+  // the stronger model for the checks (the newest Sonnet this key can use)
+  const strongModel = async () => { if (o.checkModel) return o.checkModel; await claudeModels(F, ckey, st); const ids = st.modelList || [];
+    const ver = id => parseFloat((String(id).match(/(\d+)[-.](\d+)/) || [0, 0, 0]).slice(1).join(".")) || 0;
+    return ids.filter(id => /sonnet/i.test(id)).sort((x, y) => ver(y) - ver(x))[0] || null; };
+  const pjCk = t => { const m = String(t || "").match(/\{[\s\S]*\}/); try { const j = m ? JSON.parse(m[0]) : null; return j && Array.isArray(j.checks) ? j.checks : null; } catch (e) { return null; } };
+  // FACT-FINDER CHECK FIRST (owner's pick, 17 Nov 2026 — accuracy of data is his #1 rule): every number and capacity plan
+  // the fact finder shows (companies ranked 1–1000) is re-checked on its page by the stronger model. A wrong one is taken
+  // out (kept in "dropped" with the reason) and whatever then takes its place is checked too. Same budget as the accuracy check.
+  const capCk = +(o.checkUsd ?? process.env.TREX_DEEP_CHECK_BUDGET_USD ?? 0); let ffLeft = 0, ffDone = 0;
+  if (capCk > 0 && !stopRun && !ix.keyDead && Date.now() < until - 120000) {
+    const ck = ix.ck = ix.ck || { n: 0, ok: 0, bad: 0, unclear: 0, spent: 0 };
+    const rkF = c => c.sc.r <= 100 ? c.sc.r + 1e4 : c.sc.r;                 // midcaps and smallcaps (101–1000) first, largecaps last
+    const ffTodo = Object.entries(ix.companies).filter(([, c]) => ffWait(c)).sort((a, b) => rkF(a[1]) - rkF(b[1])).map(([s]) => s);
+    const strong = ffTodo.length && (ck.spent || 0) < capCk ? await strongModel() : null;
+    if (ffTodo.length && strong) {
+      const stF = { models: [strong] }, baseF = ck.spent || 0, spentF = () => +(baseF + claudeCost(stF)).toFixed(4);
+      const ffUntil = Math.min(until - 120000, Date.now() + (o.ffMinutes ?? 25) * 60e3), tF = { n: 0, ok: 0, bad: 0, unclear: 0 };
+      async function ffCo(sym) {                                  // true = everything the fact finder shows for it is checked
+        for (let round = 0; round < 3; round++) {
+          const co = await loadCo(sym), p = ffPick(co);
+          const items = [...[p.ob1, p.ex1, p.cc1].filter(f => f && !f.ck).map(f => ({ f, doc: f.doc, page: f.page })),
+            ...p.cap.map(x => x.c).filter(c => !c.ck).map(c => ({ c, doc: c.doc, page: c.page }))];
+          if (!items.length) { await saveCo(sym, co); return true; }
+          let dropped = 0, hard = false, stop = false;
+          const byDoc = new Map(); for (const it of items) { if (!byDoc.has(it.doc)) byDoc.set(it.doc, []); byDoc.get(it.doc).push(it); }
+          for (const [doc, its] of byDoc) {
+            if (stopRun || spentF() >= capCk || Date.now() > ffUntil) { stop = true; break; }
+            const r = doc ? await pdfGet(doc) : { code: 0 }; if (r.code !== 200 || !r.body || r.body.length < 1000) { hard = true; continue; }
+            let pages = []; try { pages = await pdfText(r.body); } catch (e) { hard = true; continue; }
+            const inDoc = its.filter(it => it.page >= 1 && it.page <= pages.length);
+            for (const it of its) if (!inDoc.includes(it)) (it.f || it.c).ck = 2;          // its page is not in the document: nothing to check against
+            if (!inDoc.length) continue;
+            const pg = [...new Set(inDoc.map(it => it.page))].slice(0, 6), claims = inDoc.filter(it => pg.includes(it.page)).map((it, i) => ({ id: i + 1, ...it }));
+            const before = claudeCost(stF); let ans;
+            try { ans = await askClaude(F, ckey, CK_SYSTEM, ckPrompt(co.name, sym, p.docs[doc] || { type: "document", date: "" }, claims, pages, pg), null, stF); }
+            catch (e) { if (e.fatal || e.config) { ix.keyDead = e.fatal ? Date.now() : ix.keyDead; stopRun = true; } hard = true; break; }
+            finally { st.cost = (st.cost != null ? st.cost : claudeCost(st)) + (claudeCost(stF) - before); }   // counted in the total too
+            const list = pjCk(ans.text); if (!list) { hard = true; continue; }
+            dropped += ckApply(co, claims, list, ans.model, tF);
+          }
+          await saveCo(sym, co); const c = ix.companies[sym]; c.facts = (co.facts || []).length; c.commitments = (co.commitments || []).length;
+          if (hard) c.ffx = (c.ffx || 0) + 1;          // a document that cannot be read or answered: tried in later runs, at most 3 times
+          if (hard || stop) return false;
+          if (!dropped) return true;                   // nothing taken out → nothing new took its place
+        }
+        return true;
+      }
+      let nF = 0; const wF = async () => { while (!stopRun && Date.now() < ffUntil && spentF() < capCk) { const sym = ffTodo[nF++]; if (sym === undefined) break; try { if (await ffCo(sym)) ffDone++; } catch (e) {} ck.spent = spentF(); } };
+      await Promise.all(Array.from({ length: par }, wF));
+      ck.spent = spentF(); ck.n += tF.n; ck.ok += tF.ok; ck.bad += tF.bad; ck.unclear += tF.unclear; ix.spent = +(spent0 + claudeCost(st)).toFixed(4); dirty = true;
+      const left = Object.values(ix.companies).filter(ffWait).length; ffLeft = ck.spent < capCk ? left : 0;
+      log(`Fact-finder check: ${ffDone} compan${ffDone === 1 ? "y" : "ies"} done, ${tF.n} items this run (${tF.ok} right, ${tF.bad} wrong and taken out, ${tF.unclear} unclear) · ${left} companies left · $${ck.spent.toFixed(2)} of $${capCk} used [${strong}].`);
+      if (left || ffDone) await publish(`fact-finder check: ${left} companies left`);
+    }
+  }
   // SECOND READING of midcaps and smallcaps (SEBI ranks by market value, default 101–1000), largest first, with its own budget
   const cap2 = +(o.budget2Usd ?? process.env.TREX_DEEP2_BUDGET_USD ?? 0); let d2 = { left: 0, done: 0, docs: 0, total: 0, hit: false };
   // TREX_DEEP2_ROUND (e.g. "2026-11"): every company is visited once more in this round — only documents not read before are read.
@@ -494,8 +590,9 @@ export async function runDeep(o = {}) {
         let c3 = 0; const t3 = { n: 0, ok: 0, bad: 0, unclear: 0 };
         async function checkCo(sym) {
           const co = await loadCo(sym); const since = Date.parse(DEEP2_SINCE + "T00:00:00Z");
-          const docsOk = (co.docs || []).filter(x => x.status === 1 && Date.parse(String(x.date || "").replace(/-/g, " ") + " UTC") >= since && (co.facts || []).some(f => f.doc === x.doc));
-          const d = docsOk.sort((x, y) => (co.facts.filter(f => f.doc === y.doc).length) - (co.facts.filter(f => f.doc === x.doc).length))[0];
+          const docsOk = (co.docs || []).filter(x => x.status === 1 && Date.parse(String(x.date || "").replace(/-/g, " ") + " UTC") >= since && (co.facts || []).some(f => f.doc === x.doc && !f.ck));
+          // the newest document first (owner, 17 Nov 2026: after the fact-finder numbers, the rest goes on the newest documents)
+          const d = docsOk.sort((x, y) => (dayOf(y.date) - dayOf(x.date)) || (co.facts.filter(f => f.doc === y.doc).length) - (co.facts.filter(f => f.doc === x.doc).length))[0];
           if (!d) { ix.companies[sym].ck = Date.now(); return; }
           const fs = co.facts.filter(f => f.doc === d.doc && f.value != null && !f.ck).slice(0, 8); if (!fs.length) { ix.companies[sym].ck = Date.now(); return; }
           const r = await pdfGet(d.doc); if (r.code !== 200 || !r.body || r.body.length < 1000) return;      // could not download: next run
@@ -503,28 +600,11 @@ export async function runDeep(o = {}) {
           const pg = [...new Set(fs.map(f => f.page))].filter(n => n >= 1 && n <= pages.length).slice(0, 6);
           const claims = fs.filter(f => pg.includes(f.page)).map((f, i) => ({ id: i + 1, f }));
           if (!claims.length) { ix.companies[sym].ck = Date.now(); return; }
-          const system = "You check numbers that were taken from an Indian listed company's own document. Be strict and literal. Reply with JSON only.";
-          const prompt = `Company: ${co.name || sym} (NSE: ${sym}). Document: ${d.type}, dated ${d.date}.
-For each claim below, read the page it cites and answer:
-- "ok": the page clearly gives this number for this item and this period, in this unit / scale
-- "wrong": the number on the page belongs to something else (another item, another period or year, another unit, crore vs lakh vs million), or the page does not say it
-- "unclear": you cannot tell from the page
-For "wrong" add "why" (at most 20 words). Reply exactly as {"checks":[{"id":1,"verdict":"ok"},{"id":2,"verdict":"wrong","why":"…"}]}.
-
-Claims:
-${claims.map(c => `${c.id}. ${c.f.item} — ${c.f.metric}${c.f.period ? " — " + c.f.period : ""}: ${c.f.vtext || c.f.value} ${c.f.unit || ""} (page ${c.f.page})`).join("\n")}
-
-${pg.map(n => `=== PAGE ${n} ===\n${String(pages[n - 1] || "").slice(0, 6000)}`).join("\n\n")}`;
           const before = claudeCost(st3);
-          let ans; try { ans = await askClaude(F, ckey, system, prompt, null, st3); } catch (e) { if (e.fatal || e.config) { ix.keyDead = e.fatal ? Date.now() : ix.keyDead; stopRun = true; } return; }
-          st.cost = (st.cost != null ? st.cost : claudeCost(st)) + (claudeCost(st3) - before);       // counted in the total too
-          const j = pj(ans.text); const list = (j && Array.isArray(j.checks)) ? j.checks : null; if (!list) return;
-          const drop = new Set();
-          for (const c of claims) { const v = list.find(x => +x.id === c.id); const verdict = v && String(v.verdict || "").toLowerCase(); t3.n++;
-            if (verdict === "ok") { c.f.ck = 1; t3.ok++; }
-            else if (verdict === "wrong") { drop.add(c.f); t3.bad++; co.dropped = (co.dropped || []).concat([{ ...c.f, why: String(v.why || "").slice(0, 160), t: Date.now(), by: ans.model }]).slice(-200); }
-            else t3.unclear++; }
-          if (drop.size) co.facts = co.facts.filter(f => !drop.has(f));
+          let ans; try { ans = await askClaude(F, ckey, CK_SYSTEM, ckPrompt(co.name, sym, d, claims, pages, pg), null, st3); } catch (e) { if (e.fatal || e.config) { ix.keyDead = e.fatal ? Date.now() : ix.keyDead; stopRun = true; } return; }
+          finally { st.cost = (st.cost != null ? st.cost : claudeCost(st)) + (claudeCost(st3) - before); }       // counted in the total too
+          const list = pjCk(ans.text); if (!list) return;
+          ckApply(co, claims, list, ans.model, t3);
           await saveCo(sym, co); ix.companies[sym].ck = Date.now(); ix.companies[sym].facts = co.facts.length; c3++;
         }
         let n3 = 0; const w3 = async () => { while (!stopRun && Date.now() < until - 120000 && spent3() < cap3) { const sym = todo[n3++]; if (sym === undefined) break; try { await checkCo(sym); } catch (e) {} ck.spent = spent3(); } };
@@ -545,7 +625,7 @@ ${pg.map(n => `=== PAGE ${n} ===\n${String(pages[n - 1] || "").slice(0, 6000)}`)
   // them — otherwise the hourly timer retries them, instead of a run every 15 minutes that changes nothing.
   const unread = tg.symbols.filter(s => !ix.companies[s]).length;
   const halfDone = tg.symbols.filter(s => { const c = ix.companies[s]; return c && !(c.v >= DEEP_VERSION && c.t); }).length;
-  const more2 = (cap2 > 0 && d2.left > 0 && !d2.hit && !d2.lim &&(ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0)) || ((d2.ckLeft || 0) > 0 && (d2.ck || 0) > 0);
+  const more2 = (ffLeft > 0 && ffDone > 0) || (cap2 > 0 && d2.left > 0 && !d2.hit && !d2.lim && (ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0)) || ((d2.ckLeft || 0) > 0 && (d2.ck || 0) > 0);
   if (!o.skipGit && !ix.keyDead && ix.spent < cap && (deepMore({ unread, halfDone, docs, tidyLeft, tidyDone }) || more2)) {
     // GitHub's hourly timer is unreliable for this repository, so each run starts the next one; a run that got nothing done
     // (NSE refusing, Claude busy) asks the workflow to wait 15 minutes first

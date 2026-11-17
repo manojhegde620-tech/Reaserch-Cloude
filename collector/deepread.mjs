@@ -359,7 +359,10 @@ export async function runDeep(o = {}) {
     try { const n = await tidyCompany(sym, co, extra, (sys, pr) => askClaude(F, ckey, sys, pr, null, st)); co.tdt = Date.now(); co.tv = TIDY_VERSION; return n; }
     catch (e) { if (e.fatal || e.config) { ix.keyDead = Date.now(); stopRun = true; } return 0; }
   }
+  // the $50 plan (owner, 17 Nov 2026) is for midcaps and smallcaps: the 4-monthly refresh reads only ranks TREX_DEEP1_RANKS (e.g. "101-1500")
+  const [r1a, r1b] = String(o.ranks1 ?? process.env.TREX_DEEP1_RANKS ?? "").split("-").map(Number);
   async function processCo(sym) {
+    if (r1a && r1b) { const rk = rankMap.get(sym); if (!rk || rk < r1a || rk > r1b) return; }
     const c = ix.companies[sym]; if (c && c.t && c.v >= DEEP_VERSION && Date.now() - c.t < 120 * 864e5) return;          // read in the last 4 months
     const nTr = (order.get(sym) ?? 9999) < deepN ? deepTr : 2;
     const a = await nseG(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(nTr > 2 ? from2 : from)}&to_date=${dmy(to)}`);

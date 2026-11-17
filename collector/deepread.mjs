@@ -291,7 +291,8 @@ export async function runDeep(o = {}) {
     if (pages.join("").replace(/\s/g, "").length < 120) { mark(2, "no text in PDF (scanned images)"); return; }
     if (!/presentation|annual report/i.test(d.type) && pages.filter(p => p.trim().length > 200).length <= 2 && pages.join("").length < 5000) { mark(1, "covering letter only — the document itself is on the company's website"); return; }
     let pagesRaw = null; if (pdfText === pdfTextPoppler) { try { pagesRaw = await pdfTextPoppler(r.body, false); } catch (e) {} }
-    const sel = selectPages(pages, Math.round(budgetFor(d.type) * (mult || 1.5)));     // second reading: more pages per document if (!sel.length) { mark(1, "no business pages found"); return; }
+    const sel = selectPages(pages, Math.round(budgetFor(d.type) * (mult || 1.5)));     // second reading: more pages per document
+    if (!sel.length) { mark(1, "no business pages found"); return; }
     const { system, prompt } = buildPrompt(d.name, sym, d.type, d.date, sel, { ext: true });
     let ans; const tA = Date.now();
     try { ans = await askClaude(F, ckey, system, prompt, m => dlog(id, m.trim()), st); }
@@ -420,7 +421,7 @@ export async function runDeep(o = {}) {
     async function processCo2(sym) {
       const c = ix.companies[sym]; if (done2(c)) return;
       if (spent2() >= cap2) { d2.hit = true; return; }
-      if (++cos2 > MAXCOS2) { d2.hit = true; return; }
+      if (++cos2 > MAXCOS2) { d2.lim = true; return; }       // the test limit (not the budget): stop here, no chained run for it
       const a = await nseG(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from2b)}&to_date=${dmy(to2)}`);
       const ar = await nseG(`https://www.nseindia.com/api/annual-reports?index=equities&symbol=${encodeURIComponent(sym)}`);
       if (a.code !== 200 && ar.code !== 200) { blocked++; if (blocked >= 5) { log("Deep reading: NSE keeps refusing — stopping for this run."); stopRun = true; return; } await sleep(15000 * blocked); await session(); return; }
@@ -440,10 +441,10 @@ export async function runDeep(o = {}) {
       if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
       if (++sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); await publish(`second reading: ${list2.filter(s => done2(ix.companies[s])).length} of ${list2.length} companies`); }
     }
-    let n2 = 0; const w2 = async () => { while (!stopRun && !d2.hit && Date.now() < until - 120000 && docs < maxDocs) { const sym = list2[n2++]; if (sym === undefined) break; try { await processCo2(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
+    let n2 = 0; const w2 = async () => { while (!stopRun && !d2.hit && !d2.lim && Date.now() < until - 120000 && docs < maxDocs) { const sym = list2[n2++]; if (sym === undefined) break; try { await processCo2(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
     await Promise.all(Array.from({ length: par }, w2));
     ix.v2spent = spent2(); d2.total = list2.length; d2.left = list2.filter(s => !done2(ix.companies[s])).length;
-    log(`Second reading (midcaps and smallcaps, ranks ${rf}–${rt}): ${d2.docs} new documents this run · ${d2.total - d2.left} of ${d2.total} companies done · $${ix.v2spent.toFixed(2)} of $${cap2} used${d2.hit || ix.v2spent >= cap2 ? " — budget reached, stopping" : ""}.`);
+    log(`Second reading (midcaps and smallcaps, ranks ${rf}–${rt}): ${d2.docs} new documents this run · ${d2.total - d2.left} of ${d2.total} companies done · $${ix.v2spent.toFixed(2)} of $${cap2} used${d2.hit || ix.v2spent >= cap2 ? " — budget reached, stopping" : d2.lim ? ` — test limit of ${MAXCOS2} compan${MAXCOS2 === 1 ? "y" : "ies"} for this run reached` : ""}.`);
     // ACCURACY CHECK (after the second reading, in the time left): a stronger model re-reads the page of up to 8 numbers per
     // company (smallcaps first) and says whether each number really belongs to that item, period and unit. A number shown
     // to be wrong is taken out of the company file (kept in "dropped" with the reason); right ones are marked checked.
@@ -513,7 +514,7 @@ ${pg.map(n => `=== PAGE ${n} ===\n${String(pages[n - 1] || "").slice(0, 6000)}`)
   // them — otherwise the hourly timer retries them, instead of a run every 15 minutes that changes nothing.
   const unread = tg.symbols.filter(s => !ix.companies[s]).length;
   const halfDone = tg.symbols.filter(s => { const c = ix.companies[s]; return c && !(c.v >= DEEP_VERSION && c.t); }).length;
-  const more2 = (cap2 > 0 && d2.left > 0 && !d2.hit && (ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0)) || ((d2.ckLeft || 0) > 0 && (d2.ck || 0) > 0);
+  const more2 = (cap2 > 0 && d2.left > 0 && !d2.hit && !d2.lim &&(ix.v2spent || 0) < cap2 && (d2.docs > 0 || d2.done > 0)) || ((d2.ckLeft || 0) > 0 && (d2.ck || 0) > 0);
   if (!o.skipGit && !ix.keyDead && ix.spent < cap && (deepMore({ unread, halfDone, docs, tidyLeft, tidyDone }) || more2)) {
     // GitHub's hourly timer is unreliable for this repository, so each run starts the next one; a run that got nothing done
     // (NSE refusing, Claude busy) asks the workflow to wait 15 minutes first

@@ -39,7 +39,7 @@ jobs:
           TREX_DEEP_CHECK_BUDGET_USD: "18"  # accuracy check after the second reading (stronger model, smallcaps first): never more than this
           TREX_DEEP2_ROUND: "2026-11"      # owner's $50 plan (17 Nov 2026): every company visited once more for documents published since its reading
           TREX_DEEP1_RANKS: "101-1500"     # the 4-monthly refresh: midcaps + smallcaps only (no largecaps), as in the $50 plan
-          TREX_DEEP2_MAX_COS: "10"         # step 0 = test run on 10 companies first; set to "0" (no limit) once the test is good
+          TREX_DEEP2_MAX_COS: "0"          # no limit (step 0 = 10-company test runs #264–#266 on 17 Nov 2026 were good); the caps above still apply
           TREX_PUBLIC_LOG: "1"
       - name: Start the next run if companies remain
         if: always()

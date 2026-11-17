@@ -1,0 +1,30 @@
+# T-Rex · reading test (owner: "go ahead, be careful", 17 Nov 2026): the same company documents read twice — as the deep
+# reader reads today (thinking) and without thinking — every number checked on its page, the accuracy checker judging both.
+# Started by hand only. Nothing is saved; this public log shows only counts (no company names, no numbers).
+# Hard cap TREX_AB_USD (taken out of the $50 plan: the deep reading's total cap was lowered by the same amount).
+name: T-Rex reading test (thinking vs without)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: trex-abtest
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PDF text tool
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext
+      - name: Read the sample twice and compare
+        run: node collector/abtest.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          TREX_AB_USD: "2"      # never more than this for the whole test
+          TREX_AB_DOCS: "16"

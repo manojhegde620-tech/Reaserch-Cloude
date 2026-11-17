@@ -9,12 +9,28 @@
 // Hard cap: TREX_AB_USD (default $2), counted from Claude's own usage figures; it stops before a document would pass it.
 // Run: node collector/abtest.mjs   (needs ANTHROPIC_API_KEY and TREX_KEY — set by the workflow abtest.yml, manual only)
 import { pathToFileURL } from "node:url";
+import { execFile } from "node:child_process";
+import { readFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { selectPages, budgetFor, buildPrompt, parseFacts, parseNotes, verifyFacts, verifyNotes, parseExtras, pdfTextPoppler, askClaude, claudeCost, claudeModels } from "./insights.mjs";
 import { pickDocs2, DEEP2_SINCE } from "./deepread.mjs";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const dmy = d => `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
 const hash = s => { let h = 2166136261; for (const c of String(s)) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; };
+// documents straight from NSE's archive first, with curl and the same headers as the deep reader (NSE refuses GitHub's
+// computers for its lists, not always for its archive), then through T-Rex's server
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+const REF = "https://www.nseindia.com/companies-listing/corporate-filings-announcements";
+const curlGet = url => new Promise(res => {
+  const tmp = join(tmpdir(), "trexab-" + Date.now() + "-" + Math.random().toString(36).slice(2) + ".pdf");
+  execFile("curl", ["-sSL", "--max-time", "90", "-A", UA, "-e", REF, "-H", "Accept: application/pdf,*/*", "-o", tmp, "-w", "%{http_code}", url], { timeout: 100000 }, (e, out, err) => {
+    let body = null; try { body = readFileSync(tmp); unlinkSync(tmp); } catch (x) {}
+    res({ code: e ? 0 : +String(out).trim() || 0, body, why: e ? String(err || e.message || "curl failed").trim().slice(0, 80) : "" });
+  });
+});
+const noLink = s => String(s || "").replace(/https?:\/\/\S+/g, "[link]").replace(/\s+/g, " ").slice(0, 80);
 
 // the numbers the checker sees: up to 8, picked the same way for A and B (a fixed shuffle, not the model's own order),
 // only on pages that exist, at most 6 different pages — like the deep reader's accuracy check
@@ -53,7 +69,12 @@ export async function runAB(o = {}) {
   const trex = async (action, u) => { const w = Math.max(0, gateT - Date.now()); gateT = Math.max(Date.now(), gateT) + gap; if (w) await sleep(w);
     return F(`${server}/api/collect?action=${action}&u=${encodeURIComponent(u)}`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(120000) }); };
   const nseList = async u => { try { const r = await trex("nseapi", u); const j = await r.json().catch(() => null); return j && j.ok ? j.data : null; } catch (e) { return null; } };
-  const pdfGet = async u => { try { const r = await trex("nsedoc", u); if (!r.ok) return null; const b = Buffer.from(await r.arrayBuffer()); return b.length >= 1000 ? b : null; } catch (e) { return null; } };
+  const pdfGet = async u => {
+    let first = "";
+    if (o.direct !== false) { const c = await curlGet(u); if (c.code === 200 && c.body && c.body.length >= 1000) return { buf: c.body }; first = `direct ${c.code ? "HTTP " + c.code : noLink(c.why)}`; }
+    try { const r = await trex("nsedoc", u); if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (b.length >= 1000) return { buf: b }; return { why: `${first}; T-Rex: file too small` }; }
+      const j = await r.json().catch(() => null); return { why: `${first}${first ? "; " : ""}T-Rex HTTP ${r.status} ${noLink(j && j.error)}` }; }
+    catch (e) { return { why: `${first}${first ? "; " : ""}T-Rex: ${noLink(e.message)}` }; } };
   const t2 = await F(`${server}/api/collect?action=deeptargets2&from=101&to=1500`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }).then(r => r.json()).catch(() => null);
   const list = t2 && t2.ok && Array.isArray(t2.symbols) ? t2.symbols : [];
   if (!list.length) { log("Reading test: T-Rex gave no company list — nothing done."); return { ok: false }; }
@@ -84,7 +105,7 @@ export async function runAB(o = {}) {
     const id = i + 1, kind = d.type.replace(/\s*\d{4}-\d{4}$/, "");
     if (spent() + 0.15 > CAP) { S.stop = "cap"; log(`Reading test: stopping before document ${id} — the $${CAP} cap would be passed.`); break; }
     if (Date.now() > until - 4 * 60e3) { S.stop = "time"; log(`Reading test: stopping before document ${id} — time is up.`); break; }
-    const buf = await pdfGet(d.doc); if (!buf) { S.skipped++; log(`  doc ${id} (${kind}): could not download — skipped`); continue; }
+    const got = await pdfGet(d.doc), buf = got.buf; if (!buf) { S.skipped++; log(`  doc ${id} (${kind}): could not download (${got.why}) — skipped`); continue; }
     let pages = []; try { pages = await pdfText(buf); } catch (e) { S.skipped++; log(`  doc ${id} (${kind}): PDF damaged — skipped`); continue; }
     if (pages.join("").replace(/\s/g, "").length < 120) { S.skipped++; log(`  doc ${id} (${kind}): no text (scanned) — skipped`); continue; }
     let pagesRaw = null; if (pdfText === pdfTextPoppler) { try { pagesRaw = await pdfTextPoppler(buf, false); } catch (e) {} }

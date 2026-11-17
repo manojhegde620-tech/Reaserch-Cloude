@@ -237,7 +237,14 @@ export async function runDeep(o = {}) {
   const keep = r => { const sc = r.headers.getSetCookie ? r.headers.getSetCookie() : []; for (const c of sc) { const [kv] = c.split(";"); const i = kv.indexOf("="); if (i > 0) jar.set(kv.slice(0, i).trim(), kv.slice(i + 1).trim()); } };
   const cookie = () => [...jar].map(([k, v]) => k + "=" + v).join("; ");
   const session = async () => { try { const r = await F(REF, { headers: { "User-Agent": UA, "Accept": "text/html" }, signal: AbortSignal.timeout(20000) }); keep(r); await r.arrayBuffer(); } catch (e) {} };
-  const nseJson = async url => { try { const r = await F(url, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": REF, ...(jar.size ? { Cookie: cookie() } : {}) }, signal: AbortSignal.timeout(40000) }); keep(r); if (r.status !== 200) return { code: r.status }; return { code: 200, j: JSON.parse(await r.text()) }; } catch (e) { return { code: 0 }; } };
+  const nseDirect = async url => { try { const r = await F(url, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": REF, ...(jar.size ? { Cookie: cookie() } : {}) }, signal: AbortSignal.timeout(40000) }); keep(r); if (r.status !== 200) return { code: r.status }; return { code: 200, j: JSON.parse(await r.text()) }; } catch (e) { return { code: 0 }; } };
+  // NSE refuses GitHub's computers since 12 Nov 2026: after the first refusal, NSE's lists come through T-Rex's own server
+  // (robot key; only the four list types the reader needs), one request every 2.5 s so the server's own NSE reading is not disturbed
+  let viaTrex = !!o.viaTrex, trexGateT = 0;
+  const nseTrex = async url => { const w = Math.max(0, trexGateT - Date.now()); trexGateT = Math.max(Date.now(), trexGateT) + 2500; if (w) await sleep(w);
+    try { const r = await F(`${server}/api/collect?action=nseapi&u=${encodeURIComponent(url)}`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }); const j = await r.json().catch(() => null);
+      return j && j.ok ? { code: 200, j: j.data, via: "trex" } : { code: r.status || 0 }; } catch (e) { return { code: 0 }; } };
+  const nseJson = async url => { if (!viaTrex) { const d = await nseDirect(url); if (d.code === 200) return d; if (d.code === 401 || d.code === 403 || d.code === 0) { viaTrex = true; log("Deep reading: NSE refused this computer — continuing through T-Rex's server."); } else return d; } return nseTrex(url); };
   // PDFs: curl first (like the main collector, with the same headers), then Node's own https on a fresh connection
   const curlGet = url => new Promise(res => {
     const tmp = join(tmpdir(), "trexd-" + Date.now() + "-" + Math.random().toString(36).slice(2) + ".pdf");
@@ -259,7 +266,10 @@ export async function runDeep(o = {}) {
   const pdfGet = o.pdfGet || (async url => {
     let r = await curlGet(url); if (good(r)) return r;
     const first = r.why || "HTTP " + r.code; await session();
-    r = await httpsGet(url); if (!good(r)) r.why = `${first}; then ${r.why || "HTTP " + r.code}`; return r;
+    r = await httpsGet(url); if (good(r)) return r;
+    try { const t = await F(`${server}/api/collect?action=nsedoc&u=${encodeURIComponent(url)}`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(120000) });   // through T-Rex's server (NSE refuses this computer)
+      if (t.ok) { const body = Buffer.from(await t.arrayBuffer()); if (body.length >= 1000) return { code: 200, body, via: "trex" }; } } catch (e) {}
+    r.why = `${first}; then ${r.why || "HTTP " + r.code}`; return r;
   });
   const pdfText = o.pdfText || pdfTextPoppler;
   await session();
@@ -394,6 +404,10 @@ export async function runDeep(o = {}) {
   await Promise.all(Array.from({ length: par }, worker));
   // SECOND READING of midcaps and smallcaps (SEBI ranks by market value, default 101–1000), largest first, with its own budget
   const cap2 = +(o.budget2Usd ?? process.env.TREX_DEEP2_BUDGET_USD ?? 0); let d2 = { left: 0, done: 0, docs: 0, total: 0, hit: false };
+  // TREX_DEEP2_ROUND (e.g. "2026-11"): every company is visited once more in this round — only documents not read before are read.
+  // TREX_DEEP2_MAX_COS: at most this many companies per run (the $1 test run first).
+  const ROUND2 = String(o.round2 ?? process.env.TREX_DEEP2_ROUND ?? ""), MAXCOS2 = +(o.maxCos2 ?? process.env.TREX_DEEP2_MAX_COS ?? 0) || Infinity; let cos2 = 0;
+  const done2 = c => !!(c && c.v2 && (!ROUND2 || c.v2r === ROUND2));
   if (cap2 > 0 && !stopRun && !ix.keyDead && Date.now() < until - 120000) {
     const [rf, rt] = String(o.ranks2 || process.env.TREX_DEEP2_RANKS || "101-1000").split("-").map(Number);
     const t2 = await F(`${server}/api/collect?action=deeptargets2&from=${rf || 101}&to=${rt || 1000}`, { method: "POST", headers: { "x-trex-key": key }, signal: AbortSignal.timeout(60000) }).then(r => r.json()).catch(() => null);
@@ -401,8 +415,9 @@ export async function runDeep(o = {}) {
     const base2 = ix.v2spent || 0, c0 = claudeCost(st), spent2 = () => +(base2 + claudeCost(st) - c0).toFixed(4);
     const to2 = new Date(), from2b = new Date(DEEP2_SINCE + "T00:00:00Z");
     async function processCo2(sym) {
-      const c = ix.companies[sym]; if (c && c.v2) return;
+      const c = ix.companies[sym]; if (done2(c)) return;
       if (spent2() >= cap2) { d2.hit = true; return; }
+      if (++cos2 > MAXCOS2) { d2.hit = true; return; }
       const a = await nseG(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(sym)}&from_date=${dmy(from2b)}&to_date=${dmy(to2)}`);
       const ar = await nseG(`https://www.nseindia.com/api/annual-reports?index=equities&symbol=${encodeURIComponent(sym)}`);
       if (a.code !== 200 && ar.code !== 200) { blocked++; if (blocked >= 5) { log("Deep reading: NSE keeps refusing — stopping for this run."); stopRun = true; return; } await sleep(15000 * blocked); await session(); return; }
@@ -414,17 +429,17 @@ export async function runDeep(o = {}) {
       if (read) { co.name = (list[0] && list[0].name) || co.name || sym; await judgeCo(sym, co); await tidyCo(sym, co); }
       const pending = list.some(d => !ix.docs[d.doc] || ix.docs[d.doc].s === 0);
       const prev = ix.companies[sym] || {};
-      ix.companies[sym] = { ...prev, v2: pending ? 0 : Date.now(), docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length,
+      ix.companies[sym] = { ...prev, v2: pending ? 0 : Date.now(), v2r: pending ? (prev.v2r || "") : ROUND2, ...(read ? { ck: 0 } : {}), docs: co.docs.filter(x => x.status === 1).length, facts: co.facts.length, commitments: (co.commitments || []).length,
         n: prev.n || String(co.name || "").slice(0, 60), tg: (co.tags || []).slice(0, 6), cp: (co.competitors || []).slice(0, 10), ripe: ripeCount(co), jt: co.jt || prev.jt || 0, tv: co.tv || prev.tv || 0, tdt: co.tdt || prev.tdt || 0 };
       if (read) await saveCo(sym, co);
       d2.docs += read; if (!pending) d2.done++;
       ix.v2spent = spent2(); ix.spent = +(spent0 + claudeCost(st)).toFixed(4);
       if (ix.spent >= cap) { log(`Deep reading: budget of $${cap} reached.`); stopRun = true; }
-      if (++sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); await publish(`second reading: ${list2.filter(s => ix.companies[s] && ix.companies[s].v2).length} of ${list2.length} companies`); }
+      if (++sinceSave >= 20 || Date.now() - lastPub > 8 * 60e3) { sinceSave = 0; lastPub = Date.now(); await publish(`second reading: ${list2.filter(s => done2(ix.companies[s])).length} of ${list2.length} companies`); }
     }
     let n2 = 0; const w2 = async () => { while (!stopRun && !d2.hit && Date.now() < until - 120000 && docs < maxDocs) { const sym = list2[n2++]; if (sym === undefined) break; try { await processCo2(sym); } catch (e) { log("Deep reading: a company was skipped after an error: " + String(e.message || e).slice(0, 120)); } } };
     await Promise.all(Array.from({ length: par }, w2));
-    ix.v2spent = spent2(); d2.total = list2.length; d2.left = list2.filter(s => !(ix.companies[s] && ix.companies[s].v2)).length;
+    ix.v2spent = spent2(); d2.total = list2.length; d2.left = list2.filter(s => !done2(ix.companies[s])).length;
     log(`Second reading (midcaps and smallcaps, ranks ${rf}–${rt}): ${d2.docs} new documents this run · ${d2.total - d2.left} of ${d2.total} companies done · $${ix.v2spent.toFixed(2)} of $${cap2} used${d2.hit || ix.v2spent >= cap2 ? " — budget reached, stopping" : ""}.`);
     // ACCURACY CHECK (after the second reading, in the time left): a stronger model re-reads the page of up to 8 numbers per
     // company (smallcaps first) and says whether each number really belongs to that item, period and unit. A number shown

@@ -284,32 +284,42 @@ export async function claudeModels(F, key, st = {}) {
   st.modelList = ids;
   return st.models;
 }
+// how to ask a model to answer without thinking first (Claude docs, Nov 2026): Haiku 5.5 accepts "disabled" (at its default
+// effort); Sonnet 5.5 takes "between_tools". Older models don't think unless asked, so they get no retry.
+export const noThinkOf = m => /haiku-5/i.test(m) ? { type: "disabled" } : /sonnet-5-5/i.test(m) ? { type: "between_tools" } : null;
 export async function askClaude(F, key, system, prompt, log, st = {}) {
   let last = "", notAvail = 0;
   const models = await claudeModels(F, key, st);
   let busy = 0;
+  const noTemp = st.noTemp || (st.noTemp = new Set());      // models that refused "temperature" once: not sent again (saves a refused request per document)
   for (const model of models) {
-    let temp = true;
+    let temp = !noTemp.has(model), noThink = null;
     for (let t = 0; t < 8; t++) {
       const t0 = Date.now(); let r, txt = "";
       try { r = await F("https://api.anthropic.com/v1/messages", { method: "POST", signal: AbortSignal.timeout(150000),
         headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model, max_tokens: 16000, ...(temp ? { temperature: 0 } : {}), system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
+        body: JSON.stringify({ model, max_tokens: 16000, ...(temp ? { temperature: 0 } : {}), ...(noThink ? { thinking: noThink } : {}), system, messages: [{ role: "user", content: prompt }] }) }); txt = await r.text(); }
       catch (e) { last = `${model}: no answer in ${Math.round((Date.now() - t0) / 1000)}s`; log && log("    " + last); await sleep(5000); continue; }
       let j = null; try { j = JSON.parse(txt); } catch (e) {}
       const msg = String((j && j.error && j.error.message) || txt).replace(/\s+/g, " ").slice(0, 160);
       if (r.status === 429 || r.status === 529 || r.status >= 500) {           // busy / rate limit: wait as told, then again
         const wait = Math.min(90, Math.max(5, +(r.headers.get("retry-after") || 0) || 10 * (t + 1))); busy++; last = `${model}: HTTP ${r.status} (${r.status === 429 ? "rate limit" : "busy"})`; log && log(`    ${last} — waiting ${wait}s`); await sleep(wait * 1000); continue; }
+      // the retry without thinking was refused (its message may say "disabled"): this document is tried again later, as before — never "key ended"
+      if (noThink && r.status === 400 && !/credit balance|billing|expired/i.test(msg)) { last = `${model}: empty answer (max_tokens; retry without thinking refused: ${msg.slice(0, 80)})`; log && log("    " + last); throw new Error(last); }
       if (r.status === 401 || r.status === 403 || (r.status >= 400 && /credit balance|billing|disabled|expired/i.test(msg))) {
         const e = new Error(`Claude: ${r.status === 401 ? "the API key is not valid any more" : msg}`); e.fatal = true; throw e; }
-      if (r.status === 400 && temp && /temperature/i.test(msg)) { temp = false; continue; }   // a model that sets its own temperature
+      if (r.status === 400 && temp && /temperature/i.test(msg)) { temp = false; noTemp.add(model); continue; }   // a model that sets its own temperature
       if (r.status === 404 || (r.status === 400 && /model/i.test(msg))) { last = `${model}: not available (${msg})`; notAvail++; break; }       // try the next model
       if (!r.ok) { last = `${model}: HTTP ${r.status} ${msg}`; log && log("    " + last); const e = new Error(last); e.busy = r.status === 408 || r.status === 409; throw e; }   // a problem with this request: try it again next run — never move to a dearer model for it
       const text = ((j && j.content) || []).filter(c => c.type === "text").map(c => c.text).join("");
       const u = (j && j.usage) || {}; st.inTok = (st.inTok || 0) + (u.input_tokens || 0); st.outTok = (st.outTok || 0) + (u.output_tokens || 0);
       const pr = claudePrice(model); st.cost = (st.cost || 0) + ((u.input_tokens || 0) * pr[0] + (u.output_tokens || 0) * pr[1]) / 1e6;
-      if (text) { log && log(`    ${model} answered in ${Math.round((Date.now() - t0) / 1000)}s`); return { model, text }; }
-      last = `${model}: empty answer (${(j && j.stop_reason) || "?"})`; log && log("    " + last); throw new Error(last);
+      if (text) { log && log(`    ${model} answered in ${Math.round((Date.now() - t0) / 1000)}s${noThink ? " (without thinking)" : ""}`); return { model, text }; }
+      // Haiku 5.5 / Sonnet 5.5 think by default and the thinking counts toward max_tokens: a long document can use the whole
+      // limit thinking and return no text (17 Nov 2026: 9 of 47 in one run). Ask once more at once, without thinking first.
+      const nt = !noThink && j && j.stop_reason === "max_tokens" ? noThinkOf(model) : null;
+      if (nt) { noThink = nt; log && log(`    ${model}: empty answer (max_tokens, ${u.output_tokens || "?"} tokens thinking) — asking again without thinking`); continue; }
+      last = `${model}: empty answer (${(j && j.stop_reason) || "?"}${noThink ? ", also without thinking" : ""})`; log && log("    " + last); throw new Error(last);
     }
     if (/rate limit|busy/.test(last) && last.startsWith(model)) break;     // still busy after waiting: try this document again next run (no dearer model)
   }

@@ -22,16 +22,33 @@ const REF = "https://www.nseindia.com/companies-listing/corporate-filings-announ
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const dmy = d => `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
 export const BRANCH = "deep-data";
+// NSE's document links moved from nseindia.com to nseindia.in (seen 17 Nov 2026); both addresses serve the same file. Every
+// document is remembered under its .com address (as all earlier readings were), so the same document is never read twice;
+// the download uses the address NSE gave (d.url).
+export const docKey = u => String(u || "").replace(/^https:\/\/(nsearchives|archives)\.nseindia\.in\//i, "https://$1.nseindia.com/");
+const docOf = (d, url) => { const k = docKey(url); return k !== url ? { ...d, doc: k, url } : { ...d, doc: url }; };
+// the cleanup after 17 Nov 2026 (documents read twice under both addresses): keep the newer good reading of each document,
+// remove the other reading's facts, commitments and concerns, and use the .com address everywhere in the file
+export function fixDocLinks(co) {
+  if (!co || !Array.isArray(co.docs) || !/nseindia\.in\//i.test(JSON.stringify(co))) return null;
+  const best = new Map();
+  for (const d of co.docs) { const k = docKey(d.doc), b = best.get(k); if (!b || ((d.status === 1) - (b.status === 1) || (d.t || 0) - (b.t || 0)) > 0) best.set(k, d); }
+  const drop = new Set(co.docs.filter(d => best.get(docKey(d.doc)) !== d).map(d => d.doc));
+  const keep = x => !(x && drop.has(x.doc));
+  const out = { ...co, docs: co.docs.filter(d => best.get(docKey(d.doc)) === d) };
+  for (const f of ["facts", "commitments", "concerns", "dropped"]) if (Array.isArray(co[f])) out[f] = co[f].filter(keep);
+  return { co: JSON.parse(JSON.stringify(out).replace(/https:\/\/(nsearchives|archives)\.nseindia\.in\//gi, "https://$1.nseindia.com/")), dup: drop.size };
+}
 
 // which documents of a company to read: the latest transcript, the latest presentation, the latest annual report
 export function pickDocs(sym, ann, ars, nTr = 1) {
   const txt = r => `${r.desc || ""} ${r.attchmntText || ""} ${r.attchmntFile || ""}`;
   const pdf = r => /\.pdf$/i.test(String(r.attchmntFile || ""));
-  const mk = type => r => ({ symbol: sym, name: r.sm_name || sym, doc: r.attchmntFile, type, date: String(r.an_dt || r.sort_date || "").slice(0, 11) });
+  const mk = type => r => docOf({ symbol: sym, name: r.sm_name || sym, type, date: String(r.an_dt || r.sort_date || "").slice(0, 11) }, r.attchmntFile);
   const out = [
-    ...ann.filter(r => pdf(r) && /transcript/i.test(txt(r)) && !/investor presentation/i.test(String(r.desc || ""))).filter((r, i, arr) => arr.findIndex(x => x.attchmntFile === r.attchmntFile) === i).slice(0, nTr).map(mk("Earnings call transcript")),
+    ...ann.filter(r => pdf(r) && /transcript/i.test(txt(r)) && !/investor presentation/i.test(String(r.desc || ""))).filter((r, i, arr) => arr.findIndex(x => docKey(x.attchmntFile) === docKey(r.attchmntFile)) === i).slice(0, nTr).map(mk("Earnings call transcript")),
     ...ann.filter(r => pdf(r) && /investor presentation/i.test(String(r.desc || ""))).slice(0, 1).map(mk("Investor presentation")),
-    ...ars.filter(r => /\.pdf$/i.test(String(r.fileName || ""))).slice(0, 1).map(r => ({ symbol: sym, name: r.companyName || sym, doc: r.fileName, type: `Annual report ${r.fromYr || ""}-${r.toYr || ""}`, date: String(r.broadcast_dttm || "").slice(0, 11) })),
+    ...ars.filter(r => /\.pdf$/i.test(String(r.fileName || ""))).slice(0, 1).map(r => docOf({ symbol: sym, name: r.companyName || sym, type: `Annual report ${r.fromYr || ""}-${r.toYr || ""}`, date: String(r.broadcast_dttm || "").slice(0, 11) }, r.fileName)),
   ];
   return out.filter(d => d.doc);
 }
@@ -44,13 +61,13 @@ const annDay = r => { const t = Date.parse(String(r.an_dt || r.sort_date || "").
 export function pickDocs2(sym, ann, ars, since = DEEP2_SINCE) {
   const t0 = Date.parse(since + "T00:00:00Z");
   const txt = r => `${r.desc || ""} ${r.attchmntText || ""} ${r.attchmntFile || ""}`, pdf = r => /\.pdf$/i.test(String(r.attchmntFile || ""));
-  const mk = type => r => ({ symbol: sym, name: r.sm_name || sym, doc: r.attchmntFile, type, date: String(r.an_dt || r.sort_date || "").slice(0, 11) });
-  const recent = ann.filter(r => pdf(r) && annDay(r) >= t0), uniq = (r, i, arr) => arr.findIndex(x => x.attchmntFile === r.attchmntFile) === i;
+  const mk = type => r => docOf({ symbol: sym, name: r.sm_name || sym, type, date: String(r.an_dt || r.sort_date || "").slice(0, 11) }, r.attchmntFile);
+  const recent = ann.filter(r => pdf(r) && annDay(r) >= t0), uniq = (r, i, arr) => arr.findIndex(x => docKey(x.attchmntFile) === docKey(r.attchmntFile)) === i;
   const out = [
     ...recent.filter(r => /transcript/i.test(txt(r)) && !/investor presentation/i.test(String(r.desc || ""))).filter(uniq).slice(0, 4).map(mk("Earnings call transcript")),
     ...recent.filter(r => /investor presentation/i.test(String(r.desc || ""))).filter(uniq).slice(0, 2).map(mk("Investor presentation")),
-    ...ars.filter(r => /\.pdf$/i.test(String(r.fileName || "")) && +r.toYr >= 2025).filter((r, i, arr) => arr.findIndex(x => x.fileName === r.fileName) === i).slice(0, 2)
-      .map(r => ({ symbol: sym, name: r.companyName || sym, doc: r.fileName, type: `Annual report ${r.fromYr || ""}-${r.toYr || ""}`, date: String(r.broadcast_dttm || "").slice(0, 11) })),
+    ...ars.filter(r => /\.pdf$/i.test(String(r.fileName || "")) && +r.toYr >= 2025).filter((r, i, arr) => arr.findIndex(x => docKey(x.fileName) === docKey(r.fileName)) === i).slice(0, 2)
+      .map(r => docOf({ symbol: sym, name: r.companyName || sym, type: `Annual report ${r.fromYr || ""}-${r.toYr || ""}`, date: String(r.broadcast_dttm || "").slice(0, 11) }, r.fileName)),
   ];
   return out.filter(d => d.doc);
 }
@@ -200,6 +217,20 @@ export async function runDeep(o = {}) {
     const c = ix.companies[sym]; if (c) { try { c.sc = screenOf(co, rankMap.get(sym)); c.scv = SC_VERSION; c.fv = FLAG_VERSION; } catch (e) {} } };
   const loadCo = async sym => { try { const o = await openText(readFileSync(join(dir, "d", sym + ".json"), "utf8")); if (o) return o; } catch (e) {} return { symbol: sym, docs: [], facts: [] }; };
   if (sealOn()) { try { const n = await sealTree(join(dir, "d")); if (n) { dirty = true; log(`Deep reading: ${n} older files sealed (encrypted).`); } } catch (e) {} }
+  // once: NSE's links moved to nseindia.in and on 17 Nov 2026 documents were read a second time under the new address —
+  // every key goes back to the .com address, and company files keep only the newer reading of each document
+  if (ix.inFix !== 1) {
+    for (const [k, v] of Object.entries(ix.docs || {})) { const c = docKey(k); if (c === k) continue; const o0 = ix.docs[c]; if (!o0 || (v.s === 1 && o0.s !== 1)) ix.docs[c] = v; delete ix.docs[k]; }
+    let nco = 0, ndup = 0;
+    for (const sym of Object.keys(ix.companies || {})) {
+      let co = null; try { co = await openText(readFileSync(join(dir, "d", sym + ".json"), "utf8")); } catch (e) { continue; }
+      const fx = fixDocLinks(co); if (!fx) continue;
+      await saveCo(sym, fx.co); nco++; ndup += fx.dup;
+      const c = ix.companies[sym]; if (c) { c.docs = fx.co.docs.filter(x => x.status === 1).length; c.facts = (fx.co.facts || []).length; c.commitments = (fx.co.commitments || []).length; }
+    }
+    ix.inFix = 1; dirty = true;
+    if (nco) log(`Deep reading: NSE's links moved to nseindia.in — ${nco} company file${nco === 1 ? "" : "s"} cleaned, ${ndup} duplicate reading${ndup === 1 ? "" : "s"} removed.`);
+  }
   const publish = async (msg) => {
     writeFileSync(ixPath, await sealText(ix));
     // small index for the app's peer comparison: company name, product tags, competitors named in its documents
@@ -284,7 +315,7 @@ export async function runDeep(o = {}) {
     const id = ++dn;
     const mark = (s, note, extra = {}) => { const tries = ((ix.docs[d.doc] || {}).n || 0) + (s === 0 && !extra.transient ? 1 : 0); ix.docs[d.doc] = { s: s === 0 && tries >= 3 ? 2 : s, n: tries, v: DEEP_VERSION };
       co.docs = co.docs.filter(x => x.doc !== d.doc); co.docs.push({ doc: d.doc, symbol: sym, type: d.type, date: d.date, status: ix.docs[d.doc].s, model: extra.model || "", n: extra.n || 0, note, t: Date.now(), source: "deep" }); };
-    const tD = Date.now(); const r = await pdfGet(d.doc); const dlS = Math.round((Date.now() - tD) / 1000);
+    const tD = Date.now(); const r = await pdfGet(d.url || d.doc); const dlS = Math.round((Date.now() - tD) / 1000);
     if (r.code !== 200 || !r.body || r.body.length < 1000) { mark(0, `could not download (${r.why || "HTTP " + r.code})`); dlog(id, `could not download after ${dlS}s (${r.why || "HTTP " + r.code})`); return; }
     if (r.body.length > 40 * 1024 * 1024) { mark(2, "file too large"); return; }
     let pages = []; try { pages = await pdfText(r.body); } catch (e) { mark(0, "PDF damaged or incomplete"); return; }

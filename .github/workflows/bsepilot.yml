@@ -1,8 +1,11 @@
 # T-Rex · $1 pilot (owner's OK, 16 Nov 2026): read the figures of 10 BSE-only companies' results PDFs and check every number
-# on its page. Runs only when started by hand. Hard cap TREX_BSEPILOT_BUDGET_USD, counted by T-Rex across all runs.
+# on its page. Since 17 Nov 2026 every 2 hours for every BSE-only results PDF (owner's OK). Caps: TREX_BSEPILOT_BUDGET_USD in total,
+# TREX_BSEPDF_MONTH_USD per month, both counted by T-Rex across all runs.
 # Figures go to T-Rex only; this public log shows no company names or numbers.
 name: T-Rex BSE-only PDF pilot
 on:
+  schedule:
+    - cron: "41 */2 * * *"     # (owner 17 Nov 2026: read every BSE-only results PDF) every 2 hours; new PDFs come from BSE's feed (T-Rex, every 20 min)
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,10 +23,11 @@ jobs:
           node-version: 22
       - name: Install PDF and OCR tools
         run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils tesseract-ocr >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext && command -v tesseract
-      - name: Read the results PDFs (hard cap $1)
+      - name: Read the results PDFs (caps below)
         run: node collector/bsepilot.mjs
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
           TREX_KEY: ${{ secrets.TREX_KEY }}
-          TREX_BSEPILOT_BUDGET_USD: "1"
-          TREX_BSEPILOT_N: "10"
+          TREX_BSEPILOT_BUDGET_USD: "25"   # never more than this in total (about $0.0015 a PDF; ≈ $4–6 a results season)
+          TREX_BSEPDF_MONTH_USD: "6"       # and never more than this in one month
+          TREX_BSEPILOT_N: "60"

@@ -34,7 +34,7 @@ export async function getPdf(u, F = fetch) {
   return null;
 }
 // page texts: the PDF's own text; pages without text (scans) are read by OCR
-async function pageTexts(dir, file, nPages) {
+export async function pageTexts(dir, file, nPages) {
   let pages = []; try { pages = await pdfTextPoppler(await readFile(file)); } catch (e) {}
   while (pages.length < nPages) pages.push("");
   const ocr = [];

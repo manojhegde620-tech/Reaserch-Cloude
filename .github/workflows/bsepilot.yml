@@ -6,7 +6,7 @@
 name: T-Rex BSE-only PDF pilot
 on:
   schedule:
-    - cron: "41 */2 * * *"     # (owner 17 Nov 2026: read every BSE-only results PDF) every 2 hours; new PDFs come from BSE's feed (T-Rex, every 20 min)
+    - cron: "41 * * * *"       # every hour (18 Nov 2026: of the "every 2 hours" runs GitHub really started only 3 in 36 hours; a run with nothing to read costs nothing). New PDFs come from BSE's feed (T-Rex, every 20 min)
   workflow_dispatch:
 permissions:
   contents: read

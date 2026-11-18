@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: 22
       - name: Install PDF and OCR tools
-        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils tesseract-ocr >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext && command -v tesseract
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils tesseract-ocr tesseract-ocr-osd >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext && command -v tesseract
       - name: Read the results PDFs (caps below)
         run: node collector/bsepilot.mjs
         env:

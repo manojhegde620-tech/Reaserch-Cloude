@@ -33,10 +33,13 @@ export async function getPdf(u, F = fetch) {
   try { const r = await trex("bsepdf", "&u=" + encodeURIComponent(u)); if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (isPdf(b)) return { b, via: "server" }; } } catch (e) {}
   return null;
 }
+// pdftotext ends every page with a page break, so the piece after the last break is not a page (18 Nov 2026: with "always the
+// first six pages" a 3-page PDF was asked for a 4th page and could not be read). n = pages counted by pdfinfo (0 = unknown).
+export const realPages = (pages, n) => { const p = (pages || []).slice(0, n > 0 ? n : Math.max(1, (pages || []).length - 1)); while (p.length < (n || 0)) p.push(""); return p; };
 // page texts: the PDF's own text; pages without text (scans) are read by OCR
 export async function pageTexts(dir, file, nPages) {
   let pages = []; try { pages = await pdfTextPoppler(await readFile(file)); } catch (e) {}
-  while (pages.length < nPages) pages.push("");
+  pages = realPages(pages, nPages); nPages = pages.length;
   const ocr = [];
   for (let i = 0; i < Math.min(nPages, 12); i++) {
     if ((pages[i] || "").replace(/\s+/g, "").length >= 300) continue;
@@ -185,7 +188,7 @@ export async function attach(dir, file, pick) {
     out.push({ type: "image", source: { type: "base64", media_type: "image/png", data: (await readFile(pre + ".png")).toString("base64") } }); }
   return out;
 }
-export const RV = 4;                                    // version of the reader's checks (older readings are read again once)
+export const RV = 5;                                    // version of the reader's checks (older readings are read again once)
 
 async function main() {
   if (!KEY || !CKEY) { log("Pilot: TREX_KEY or ANTHROPIC_API_KEY missing — nothing done."); return; }
@@ -202,10 +205,9 @@ async function main() {
     if (Date.now() > until) { log(`BSE PDFs: time is up — ${tg.rows.length - k + 1} left for the next run.`); break; }
     const dir = await mkdtemp(join(tmpdir(), "bsep-")); const id = `doc ${k}`, c0 = st.cost || 0; let counted = false;
     try {
-      const got = await getPdf(co.pdf); if (!got) { log(`  ${id}: could not download`); await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { rv: RV, err: "download failed", again: 1 } }); continue; }
+      const got = await getPdf(co.pdf); if (!got) { log(`  ${id}: could not download`); await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { rv: RV, arv: RV, err: "download failed", again: 1 } }); continue; }
       const file = join(dir, "a.pdf"); await writeFile(file, got.b);
-      const nPages = +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 1;
-      const { pages, ocr } = await pageTexts(dir, file, nPages);
+      const { pages, ocr } = await pageTexts(dir, file, +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 0), nPages = pages.length;
       const texts = pages.map(t => [t || ""]), joined = i => (texts[i] || []).filter(Boolean).join("\n");       // per page: the PDF's own text, then OCR readings
       // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): pages 7–14 are
       // read by OCR as well, to find a table further back (the first six pages are always shown to the reader)
@@ -236,7 +238,7 @@ async function main() {
     } catch (e) { const cost = Math.max(0, (st.cost || 0) - c0); if (!counted) { spent += cost; spentM += cost; }
       log(`  ${id}: ${String(e.message || e).replace(/https?:\/\/\S+/g, "[link]").slice(0, 140)}`); if (e.fatal) break;
       // a read that failed (busy, no answer…): its cost is counted and T-Rex offers the PDF again — three tries at most
-      try { await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost, data: { rv: RV, err: "reading failed", again: 1 } }); } catch (x) {} }
+      try { await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost, data: { rv: RV, arv: RV, err: "reading failed", again: 1 } }); } catch (x) {} }
     finally { await rm(dir, { recursive: true, force: true }); }
   }
   log(`Pilot: done — ${passed} of ${docs} PDFs gave figures that passed every check. Spent this run $${(st.cost || 0).toFixed(4)}; in total about $${spent.toFixed(4)} of $${CAP}.`);

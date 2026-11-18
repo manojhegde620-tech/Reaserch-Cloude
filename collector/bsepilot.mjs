@@ -47,9 +47,13 @@ export async function pageTexts(dir, file, nPages) {
 }
 const KW = /revenue from operations|income from operations|total income|profit before tax|net profit|total expenses|profit \/ ?\(loss\)|earnings per share/gi;
 export const kwScore = t => (String(t || "").match(KW) || []).length;
+// The pages shown to the reader: the four with the most results-table words — and (v4, seen in the first v3 run: a 19-page PDF
+// whose table sat on page 5 as a picture, while pages 9 and 11 had the words) ALWAYS the first six pages too, eight at most.
+// A results table that is a picture or a poor scan has no words to find, and it is nearly always among the first pages.
 export function pickPages(pages) {
-  const sc = pages.map((t, i) => ({ i, s: kwScore(t) })).filter(x => x.s >= 2).sort((a, b) => b.s - a.s).slice(0, 4).map(x => x.i).sort((a, b) => a - b);
-  return sc.length ? sc : pages.slice(0, 6).map((_, i) => i);
+  const set = new Set(pages.map((t, i) => ({ i, s: kwScore(t) })).filter(x => x.s >= 2).sort((a, b) => b.s - a.s).slice(0, 4).map(x => x.i));
+  for (let i = 0; i < pages.length && i < 6 && set.size < 8; i++) set.add(i);
+  return [...set].sort((a, b) => a - b);
 }
 // (v3, 18 Nov 2026) one page read by OCR — free, and only when needed: a results table that is a picture inside a "text" PDF,
 // a PDF whose own text is unreadable, or a scan that the first OCR pass read poorly. dpi 220 / 300; mode 6 = one block of text,
@@ -71,12 +75,14 @@ export function onPage(v, text) {
 // but in another row). The line holding the number (or the line just above / below it, for labels that wrap) must carry the
 // row's own label. [accepted label, refused label]
 const ROW = {
-  // (v3) finance companies print "Total revenue from operations" (interest + fees + …) and then "Other income" → "Total income"
-  revenue: [/(revenue|income) from operation|net sales|sales|turnover/i, /total (?!revenue from operation)|other/i], other_income: [/other income/i], total_income: [/total (revenue|income)|total income from operation/i, /total revenue from operation/i],
-  total_expenses: [/total expen/i], finance_costs: [/finance cost|interest/i], depreciation: [/depreciation|amorti[sz]ation/i],
+  // (v3) finance companies print "Total revenue from operations" (interest + fees + …) and then "Other income" → "Total income";
+  // a highlights table says "Revenues" / "Operating income", "PBT", "PAT" (seen 18 Nov 2026) — the arithmetic still has to hold
+  revenue: [/(revenue|income) from operation|net sales|sales|turnover|operating (income|revenue)|^\W*(\w{1,3}[.)]\s*)?(net )?revenues?\W*$/i, /total (?!revenue from operation)|other|margin/i],
+  other_income: [/other income/i], total_income: [/total (revenue|income)|total income from operation/i, /total revenue from operation/i],
+  total_expenses: [/total\W{0,3}expen/i], finance_costs: [/finance (cost|expense|charge)|interest/i], depreciation: [/depreciation|amorti[sz]ation/i],
   exceptional: [/exceptional/i, /before|after/i], share_associates: [/share (of|in) .{0,24}(profit|loss|result)|associate|joint venture/i, /before|after|attributable|total/i],
-  pbt: [/before tax/i, /exceptional items and tax|before exceptional|before share/i],
-  tax: [/tax/i, /before tax|after tax/i], net_profit: [/profit|loss/i, /before tax|exceptional|discontinued|comprehensive|attributable/i], eps_basic: [/basic|earnings? per share|eps/i] };
+  pbt: [/before tax|\bPBT\b/i, /exceptional items and tax|before exceptional|before share|margin/i],
+  tax: [/tax/i, /before tax|after tax/i], net_profit: [/profit|loss|\bPAT\b/i, /before tax|exceptional|discontinued|comprehensive|attributable|margin|\bPBT\b/i], eps_basic: [/basic|earnings? per share|eps/i] };
 // where is this number on the page, and is that line the right row?
 //   → { ok, label: the row's own words, dec: decimals as printed, near: the labels of other rows holding the number, or "absent" }
 export function rowHit(v, text, field) {
@@ -164,7 +170,22 @@ const prompt = (co, pages) => `The attached document holds pages ${pages.map(p =
 Find the statement(s) of financial results (profit and loss). For EACH statement present (standalone and/or consolidated) return every column of the table (this quarter, previous quarter, same quarter last year, half-years, year):
 {"statements":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. Rs. in Lakhs","columns":[{"label":"as printed","end":"YYYY-MM-DD","months":3|6|9|12,"page":<position of the page in the ATTACHED document: 1 = its first page>,"revenue":n,"other_income":n,"total_income":n,"total_expenses":n,"finance_costs":n,"depreciation":n,"exceptional":n,"share_associates":n,"pbt":n,"tax":n,"net_profit":n,"eps_basic":n}]}]}
 revenue = revenue from operations (or income from operations; for a finance company "total revenue from operations"); total_income = revenue + other income, as printed; total_expenses = the "total expenses" line as printed; exceptional = exceptional items (null if none); share_associates = share of profit/(loss) of associates and joint ventures (null if none); pbt = profit before tax (after exceptional items); tax = total tax expense; net_profit = profit for the period after tax; eps_basic = basic EPS in rupees. If there is no results table (for example a press release or a newspaper extract), answer {"statements":[]}.`;
-export const RV = 3;                                    // version of the reader's checks (older readings are read again once)
+// the picked pages for the reader: one small PDF; when the PDF cannot be cut (protected or damaged — seen 18 Nov 2026), its
+// pages are drawn again, and as a last resort sent as pictures
+export async function attach(dir, file, pick) {
+  const one = async (p, tool) => { const out = join(dir, `s-${p + 1}.pdf`);
+    if (tool === "cut") await sh("pdfseparate", ["-f", String(p + 1), "-l", String(p + 1), file, join(dir, "s-%d.pdf")]); else await sh("pdftocairo", ["-pdf", "-f", String(p + 1), "-l", String(p + 1), file, out]);
+    return out; };
+  for (const tool of ["cut", "draw"]) {
+    try { const parts = []; for (const p of pick) parts.push(await one(p, tool));
+      const sub = join(dir, "sub.pdf"); if (parts.length > 1) await sh("pdfunite", [...parts, sub]); else await writeFile(sub, await readFile(parts[0]));
+      return [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: (await readFile(sub)).toString("base64") } }]; } catch (e) {}
+  }
+  const out = []; for (const p of pick) { const pre = join(dir, `i-${p + 1}`); await sh("pdftoppm", ["-r", "130", "-png", "-f", String(p + 1), "-l", String(p + 1), "-singlefile", file, pre]);
+    out.push({ type: "image", source: { type: "base64", media_type: "image/png", data: (await readFile(pre + ".png")).toString("base64") } }); }
+  return out;
+}
+export const RV = 4;                                    // version of the reader's checks (older readings are read again once)
 
 async function main() {
   if (!KEY || !CKEY) { log("Pilot: TREX_KEY or ANTHROPIC_API_KEY missing — nothing done."); return; }
@@ -186,14 +207,13 @@ async function main() {
       const nPages = +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 1;
       const { pages, ocr } = await pageTexts(dir, file, nPages);
       const texts = pages.map(t => [t || ""]), joined = i => (texts[i] || []).filter(Boolean).join("\n");       // per page: the PDF's own text, then OCR readings
-      // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): the first
-      // pages are read by OCR as well, so the right pages are found
-      if (!pages.some(t => kwScore(t) >= 2)) for (let i = 0; i < Math.min(nPages, 16) && Date.now() < until; i++) { if (ocr.includes(i + 1)) continue;
+      // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): pages 7–14 are
+      // read by OCR as well, to find a table further back (the first six pages are always shown to the reader)
+      if (!pages.some(t => kwScore(t) >= 2)) for (let i = 6; i < Math.min(nPages, 14) && Date.now() < until; i++) { if (ocr.includes(i + 1)) continue;
         const t = await ocrPage(dir, file, i, 220, 6); if (t.replace(/\s+/g, "").length > 50) { texts[i].push(t); ocr.push(i + 1); } }
       const pick = pickPages(texts.map((_, i) => joined(i)));
-      const parts = []; for (const p of pick) { await sh("pdfseparate", ["-f", String(p + 1), "-l", String(p + 1), file, join(dir, "s-%d.pdf")]); parts.push(join(dir, `s-${p + 1}.pdf`)); }
-      const sub = join(dir, "sub.pdf"); if (parts.length > 1) await sh("pdfunite", [...parts, sub]); else await writeFile(sub, await readFile(parts[0]));
-      const ans = await askClaude(fetch, CKEY, SYSTEM, [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: (await readFile(sub)).toString("base64") } }, { type: "text", text: prompt(co, pick) }], null, st);
+      const doc = await attach(dir, file, pick);
+      const ans = await askClaude(fetch, CKEY, SYSTEM, [...doc, { type: "text", text: prompt(co, pick) }], null, st);
       const cost = (st.cost || 0) - c0; spent += cost; spentM += cost; counted = true;
       let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
       const statements = (j && Array.isArray(j.statements)) ? j.statements.slice(0, 4) : [];
@@ -204,7 +224,8 @@ async function main() {
       // of what is printed, never a looser check
       for (const [dpi, psm] of [[300, 6], [300, 4]]) {
         if (Date.now() > until || !statements.some(s => (s.columns || []).some(c => !c.ok && c.miss && KEYF.some(f => c.miss[f])))) break;
-        for (const p of pick) { const t = await ocrPage(dir, file, p, dpi, psm); if (t) texts[p].push(t); }
+        const need = new Set(statements.flatMap(s => (s.columns || []).filter(c => !c.ok).map(c => at(c.page))));       // the pages those columns are on
+        for (const p of need) { const t = await ocrPage(dir, file, p, dpi, psm); if (t) texts[p].push(t); }
         wit.push(dpi + "/" + psm); ck = check(statements, pageOf, cands());
       }
       for (const s of statements) for (const c of s.columns || []) c.page = at(c.page) + 1;   // page of the original PDF

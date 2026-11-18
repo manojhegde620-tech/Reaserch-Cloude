@@ -1,7 +1,8 @@
 # T-Rex · $1 pilot (owner's OK, 16 Nov 2026): read the figures of 10 BSE-only companies' results PDFs and check every number
 # on its page. Since 17 Nov 2026 every 2 hours for every BSE-only results PDF (owner's OK). Caps: TREX_BSEPILOT_BUDGET_USD in total,
 # TREX_BSEPDF_MONTH_USD per month, both counted by T-Rex across all runs.
-# Figures go to T-Rex only; this public log shows no company names or numbers.
+# Reader v3 (18 Nov 2026): a table that is a picture, or a poor scan, is read again by OCR (free) as one more witness of what is
+# printed; totals must add up to rounding. Figures go to T-Rex only; this public log shows no company names or numbers.
 name: T-Rex BSE-only PDF pilot
 on:
   schedule:
@@ -31,3 +32,4 @@ jobs:
           TREX_BSEPILOT_BUDGET_USD: "25"   # never more than this in total (about $0.0015 a PDF; ≈ $4–6 a results season)
           TREX_BSEPDF_MONTH_USD: "6"       # and never more than this in one month
           TREX_BSEPILOT_N: "60"
+          TREX_BSEPILOT_MINUTES: "22"      # no new PDF is started after this many minutes (the job has 30); the rest waits for the next run

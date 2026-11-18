@@ -98,6 +98,11 @@ export function rowHit(v, text, field) {
     const own = lab(L[i]), ks = /[a-z]{3}/i.test(own) ? [i] : [i - 1, i + 1];        // a label of its own decides; neighbours only when it wrapped
     for (const k of ks) { const t = lab(L[k] || ""); if (r[0].test(t) && !(r[1] && r[1].test(t))) return { ok: true, label: t.slice(0, 48), dec }; }
     if (near.length < 2) near.push((own || lab(L[i - 1] || "")).slice(0, 48)); }
+  // (18 Nov 2026, Purohit Construction: no sales, printed "-") a zero is printed as a dash: it counts only when the line carries
+  // the row's OWN label and a dash cell among its numbers ("Work-in-Progress" or "-9.95" are not dash cells); the totals must
+  // still add up with the other numbers found on the page (sumsOf), so a wrong zero cannot pass
+  if (+v === 0 && r) for (const l of L) { const tail = (/[-–—\d.,()\s]+$/.exec(l) || [""])[0], own = lab(l);
+    if (/(^|\s)[-–—](?=\s|$)/.test(tail) && /[a-z]{3}/i.test(own) && r[0].test(own) && !(r[1] && r[1].test(own))) return { ok: true, label: own.slice(0, 48), dec: 0 }; }
   return { ok: false, near: near.length ? near : "absent" };
 }
 export function onRow(v, text, field) { return rowHit(v, text, field).ok; }
@@ -174,21 +179,30 @@ Find the statement(s) of financial results (profit and loss). For EACH statement
 {"statements":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. Rs. in Lakhs","columns":[{"label":"as printed","end":"YYYY-MM-DD","months":3|6|9|12,"page":<position of the page in the ATTACHED document: 1 = its first page>,"revenue":n,"other_income":n,"total_income":n,"total_expenses":n,"finance_costs":n,"depreciation":n,"exceptional":n,"share_associates":n,"pbt":n,"tax":n,"net_profit":n,"eps_basic":n}]}]}
 revenue = revenue from operations (or income from operations; for a finance company "total revenue from operations"); total_income = revenue + other income, as printed; total_expenses = the "total expenses" line as printed; exceptional = exceptional items (null if none); share_associates = share of profit/(loss) of associates and joint ventures (null if none); pbt = profit before tax (after exceptional items); tax = total tax expense; net_profit = profit for the period after tax; eps_basic = basic EPS in rupees. If there is no results table (for example a press release or a newspaper extract), answer {"statements":[]}.`;
 // the picked pages for the reader: one small PDF; when the PDF cannot be cut (protected or damaged — seen 18 Nov 2026), its
-// pages are drawn again, and as a last resort sent as pictures
-export async function attach(dir, file, pick) {
+// pages are drawn again, and as a last resort sent as pictures. (18 Nov 2026, run #10) the picked pages of a big scan can be far
+// over what one request may carry (52 MB and 123 MB seen → "PDF exceeds 32 MB"): over `max` bytes (base64 adds a third) the
+// pages go as JPEG pictures, 150 dpi, then 100 dpi if the pictures together are still too big
+export const MAXPDF = 20e6;
+export async function attach(dir, file, pick, max = MAXPDF) {
   const one = async (p, tool) => { const out = join(dir, `s-${p + 1}.pdf`);
     if (tool === "cut") await sh("pdfseparate", ["-f", String(p + 1), "-l", String(p + 1), file, join(dir, "s-%d.pdf")]); else await sh("pdftocairo", ["-pdf", "-f", String(p + 1), "-l", String(p + 1), file, out]);
     return out; };
   for (const tool of ["cut", "draw"]) {
     try { const parts = []; for (const p of pick) parts.push(await one(p, tool));
       const sub = join(dir, "sub.pdf"); if (parts.length > 1) await sh("pdfunite", [...parts, sub]); else await writeFile(sub, await readFile(parts[0]));
-      return [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: (await readFile(sub)).toString("base64") } }]; } catch (e) {}
+      const b = await readFile(sub); if (b.length > max) continue;
+      return [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: b.toString("base64") } }]; } catch (e) {}
   }
-  const out = []; for (const p of pick) { const pre = join(dir, `i-${p + 1}`); await sh("pdftoppm", ["-r", "130", "-png", "-f", String(p + 1), "-l", String(p + 1), "-singlefile", file, pre]);
-    out.push({ type: "image", source: { type: "base64", media_type: "image/png", data: (await readFile(pre + ".png")).toString("base64") } }); }
-  return out;
+  let out = [];
+  for (const dpi of [150, 100]) { out = []; let size = 0;
+    for (const p of pick) { const pre = join(dir, `i-${dpi}-${p + 1}`);
+      try { await sh("pdftoppm", ["-r", String(dpi), "-jpeg", "-jpegopt", "quality=85", "-f", String(p + 1), "-l", String(p + 1), "-singlefile", file, pre]);
+        const b = await readFile(pre + ".jpg"); size += b.length; out.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b.toString("base64") } }); } catch (e) {} }
+    if (size <= max) break; }
+  if (!out.length) throw new Error("pages could not be prepared");
+  return [{ type: "text", text: "The pages below are pictures, one per page, in the order of the page list in the request." }, ...out];
 }
-export const RV = 6;                                    // version of the reader's checks (older readings are read again once)
+export const RV = 7;                                    // version of the reader's checks (older readings are read again once)
 
 // ---- (v6) what the checks found wrong, in plain words — given to the reader for ONE more reading of the same pages. The second
 //      answer goes through exactly the same checks; nothing is accepted because the reader "says so".
@@ -239,7 +253,7 @@ export async function run(o = {}) {
       // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): pages 7–14 are
       // read by OCR as well, to find a table further back (the first six pages are always shown to the reader)
       if (!pages.some(t => kwScore(t) >= 2)) await ocrMore(6, 14);
-      const read = async (pick, hint) => { const doc = await attach(dir, file, pick);
+      const read = async (pick, hint) => { const doc = await attach(dir, file, pick, +o.maxPdf || MAXPDF);
         const ans = await ask(SYSTEM, [...doc, { type: "text", text: prompt(co, pick) + (hint || "") }], st);
         let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
         return { pick, model: ans.model, statements: (j && Array.isArray(j.statements)) ? j.statements.slice(0, 4) : [] }; };
@@ -248,7 +262,8 @@ export async function run(o = {}) {
       const verify = async R => { const at = n => R.pick[Math.max(0, Math.min(R.pick.length - 1, Math.round(+n || 1) - 1))] ?? 0;
         const pageOf = n => joined(at(n)), cands = () => R.pick.map((p, x) => ({ p: x + 1, text: joined(p) }));
         R.at = at; R.ck = check(R.statements, pageOf, cands()); R.wit = 0;
-        for (const [dpi, psm] of [[300, 6], [300, 4]]) {
+        // (18 Nov 2026, K G Denim) mode 1 finds the page's orientation itself: a table scanned SIDEWAYS is read the right way up
+        for (const [dpi, psm] of [[300, 6], [300, 4], [300, 1]]) {
           if (Date.now() > until || !R.statements.some(s => (s.columns || []).some(c => !c.ok && c.miss && KEYF.some(f => c.miss[f])))) break;
           const need = new Set(R.statements.flatMap(s => (s.columns || []).filter(c => !c.ok).map(c => at(c.page)))); let fresh = 0;
           for (const p of need) { const key = p + "/" + dpi + "/" + psm; if (seen.has(key)) continue; seen.add(key); const t = await ocrPage(dir, file, p, dpi, psm); if (t) { texts[p].push(t); fresh++; } }

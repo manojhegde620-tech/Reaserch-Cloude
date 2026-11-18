@@ -46,98 +46,178 @@ export async function pageTexts(dir, file, nPages) {
   return { pages, ocr };
 }
 const KW = /revenue from operations|income from operations|total income|profit before tax|net profit|total expenses|profit \/ ?\(loss\)|earnings per share/gi;
+export const kwScore = t => (String(t || "").match(KW) || []).length;
 export function pickPages(pages) {
-  const sc = pages.map((t, i) => ({ i, s: (String(t).match(KW) || []).length })).filter(x => x.s >= 2).sort((a, b) => b.s - a.s).slice(0, 4).map(x => x.i).sort((a, b) => a - b);
+  const sc = pages.map((t, i) => ({ i, s: kwScore(t) })).filter(x => x.s >= 2).sort((a, b) => b.s - a.s).slice(0, 4).map(x => x.i).sort((a, b) => a - b);
   return sc.length ? sc : pages.slice(0, 6).map((_, i) => i);
 }
+// (v3, 18 Nov 2026) one page read by OCR — free, and only when needed: a results table that is a picture inside a "text" PDF,
+// a PDF whose own text is unreadable, or a scan that the first OCR pass read poorly. dpi 220 / 300; mode 6 = one block of text,
+// mode 4 = columns of text. Each reading is one more WITNESS of what is printed: a number counts when any witness shows it
+// in its own row.
+export async function ocrPage(dir, file, i, dpi = 300, psm = 6) {
+  const pre = join(dir, `o${i + 1}-${dpi}`);
+  try { await sh("pdftoppm", ["-r", String(dpi), "-gray", "-png", "-f", String(i + 1), "-l", String(i + 1), "-singlefile", file, pre]);
+    return await sh("tesseract", [pre + ".png", "-", "--psm", String(psm)]); } catch (e) { return ""; }
+}
 // a number as printed (1,23,456.78 / (123.45) / -12) → is it on this page?
+const numForms = v => { const a = Math.abs(+v); return [...new Set([String(a), a.toFixed(2), a.toFixed(1), a.toFixed(0)].filter(f => Math.abs(+f - a) < 1e-9))].map(f => new RegExp(`(?<![\\d.])${f.replace(".", "\\.")}(?![\\d])`)); };
 export function onPage(v, text) {
   if (v == null || !isFinite(+v)) return false;
-  const a = Math.abs(+v), t = String(text || "").replace(/(\d),(?=\d)/g, "$1");                 // 1,23,456.78 → 123456.78
-  const forms = new Set([String(a), a.toFixed(2), a.toFixed(1), a.toFixed(0)].filter(f => +f === a || Math.abs(+f - a) < 1e-9));
-  return [...forms].some(f => new RegExp(`(?<![\\d.])${f.replace(".", "\\.")}(?![\\d])`).test(t));
+  const t = String(text || "").replace(/(\d),(?=\d)/g, "$1");                 // 1,23,456.78 → 123456.78
+  return numForms(v).some(re => re.test(t));
 }
 // …and is it in the right ROW? (pilot, 16 Nov 2026: a scanned PDF gave "total income" as sales — the number was on the page,
 // but in another row). The line holding the number (or the line just above / below it, for labels that wrap) must carry the
-// row's own label.
-const ROW = { revenue: [/(revenue|income) from operation|net sales|sales|turnover/i, /total|other/i], other_income: [/other income/i], total_income: [/total (revenue|income)|total income from operation/i],
-  total_expenses: [/total expen/i], finance_costs: [/finance cost|interest/i], depreciation: [/depreciation|amorti[sz]ation/i], pbt: [/before tax/i, /exceptional items and tax|before exceptional/i],
+// row's own label. [accepted label, refused label]
+const ROW = {
+  // (v3) finance companies print "Total revenue from operations" (interest + fees + …) and then "Other income" → "Total income"
+  revenue: [/(revenue|income) from operation|net sales|sales|turnover/i, /total (?!revenue from operation)|other/i], other_income: [/other income/i], total_income: [/total (revenue|income)|total income from operation/i, /total revenue from operation/i],
+  total_expenses: [/total expen/i], finance_costs: [/finance cost|interest/i], depreciation: [/depreciation|amorti[sz]ation/i],
+  exceptional: [/exceptional/i, /before|after/i], share_associates: [/share (of|in) .{0,24}(profit|loss|result)|associate|joint venture/i, /before|after|attributable|total/i],
+  pbt: [/before tax/i, /exceptional items and tax|before exceptional|before share/i],
   tax: [/tax/i, /before tax|after tax/i], net_profit: [/profit|loss/i, /before tax|exceptional|discontinued|comprehensive|attributable/i], eps_basic: [/basic|earnings? per share|eps/i] };
-export function onRow(v, text, field) {
-  if (!onPage(v, text)) return false; const r = ROW[field]; if (!r) return true;
-  const L = String(text || "").split(/\r?\n/).map(l => l.replace(/(\d),(?=\d)/g, "$1")), a = Math.abs(+v);
-  const forms = [String(a), a.toFixed(2), a.toFixed(1), a.toFixed(0)].filter(f => Math.abs(+f - a) < 1e-9).map(f => new RegExp(`(?<![\\d.])${f.replace(".", "\\.")}(?![\\d])`));
-  const lab = l => l.replace(/[-\d.,()\s]+$/g, " ");
-  for (let i = 0; i < L.length; i++) { if (!forms.some(re => re.test(L[i]))) continue;
+// where is this number on the page, and is that line the right row?
+//   → { ok, label: the row's own words, dec: decimals as printed, near: the labels of other rows holding the number, or "absent" }
+export function rowHit(v, text, field) {
+  if (v == null || !isFinite(+v)) return { ok: false, near: "absent" };
+  const r = ROW[field], L = String(text || "").split(/\r?\n/).map(l => l.replace(/(\d),(?=\d)/g, "$1")), forms = numForms(v), near = [];
+  const lab = l => String(l || "").replace(/[-\d.,()\s]+$/g, " ").replace(/\s+/g, " ").trim();
+  for (let i = 0; i < L.length; i++) { let m = null; for (const re of forms) { m = re.exec(L[i]); if (m) break; } if (!m) continue;
+    const tail = /^\.(\d+)/.exec(L[i].slice(m.index + m[0].length)), dec = Math.min(4, ((m[0].split(".")[1] || "").length) + (tail ? tail[1].length : 0));
+    if (!r) return { ok: true, label: lab(L[i]).slice(0, 48), dec };
     const own = lab(L[i]), ks = /[a-z]{3}/i.test(own) ? [i] : [i - 1, i + 1];        // a label of its own decides; neighbours only when it wrapped
-    for (const k of ks) { const t = lab(L[k] || ""); if (r[0].test(t) && !(r[1] && r[1].test(t))) return true; } }
-  return false;
+    for (const k of ks) { const t = lab(L[k] || ""); if (r[0].test(t) && !(r[1] && r[1].test(t))) return { ok: true, label: t.slice(0, 48), dec }; }
+    if (near.length < 2) near.push((own || lab(L[i - 1] || "")).slice(0, 48)); }
+  return { ok: false, near: near.length ? near : "absent" };
 }
+export function onRow(v, text, field) { return rowHit(v, text, field).ok; }
 // ₹ crore per printed unit; null when the unit is not clear (then nothing is shown)
 export function unitFactor(u) {
   const s = String(u || "").toLowerCase();
   if (/lakh|lac/.test(s)) return 0.01; if (/crore|\bcr\b/.test(s)) return 1; if (/million|mn\b/.test(s)) return 0.1;
   if (/thousand|'000|000s|in 000/.test(s)) return 1e-4; if (/rupees|rs\.?$|inr$|₹$/.test(s.trim())) return 1e-7; return null;
 }
-const FIELDS = ["revenue", "other_income", "total_income", "total_expenses", "finance_costs", "depreciation", "pbt", "tax", "net_profit", "eps_basic"];
-export function check(statements, pageOf) {
-  let found = 0, total = 0;
+const FIELDS = ["revenue", "other_income", "total_income", "total_expenses", "finance_costs", "depreciation", "exceptional", "share_associates", "pbt", "tax", "net_profit", "eps_basic"];
+const KEYF = ["revenue", "total_income", "total_expenses", "pbt", "tax", "net_profit"];
+function colHits(c, txt) {
+  const on = {}, rows = {}, miss = {}; let n = 0, dec = 0;
+  for (const f of FIELDS) { if (c[f] == null) continue; const h = rowHit(c[f], txt, f); on[f] = h.ok;
+    if (h.ok) { n++; if (KEYF.includes(f)) rows[f] = h.label; if (f !== "eps_basic" && h.dec > dec) dec = h.dec; } else miss[f] = h.near; }
+  return { on, rows, miss, n, dec };
+}
+// (v3, accuracy first) the totals must add up to ROUNDING — half a unit of the last printed decimal per number — not "within
+// 1.5": on a small company's table 1.5 lakh is a large error. A gap between income − expenses and profit before tax must be
+// explained by a line found in its own row: exceptional items, the share of associates' profit, or an expenses total printed
+// before finance costs and depreciation.
+export function sumsOf(c, on, d) {
+  const v = k => (c[k] == null || !isFinite(+c[k])) ? null : +c[k], has = k => v(k) != null && !!on[k];
+  const nr = (x, y, n) => Math.abs(x - y) <= 0.5 * n * Math.pow(10, -d) + 1e-9;
+  const out = { income: v("total_income") == null || v("revenue") == null ? null : nr(v("revenue") + (v("other_income") || 0), v("total_income"), 3), pbt: null, np: null };
+  if (v("total_income") != null && v("total_expenses") != null && v("pbt") != null) {
+    const base = v("total_income") - v("total_expenses"), P = v("pbt"), ex = has("exceptional") ? v("exceptional") : null, sh = has("share_associates") ? v("share_associates") : null,
+      fd = has("finance_costs") && has("depreciation") ? v("finance_costs") + v("depreciation") : null, T = [["", base, 3]];
+    if (ex != null) T.push(["x", base + ex, 4], ["x", base - ex, 4]);
+    if (sh != null) T.push(["s", base + sh, 4]);
+    if (ex != null && sh != null) T.push(["xs", base + ex + sh, 5], ["xs", base - ex + sh, 5]);
+    if (fd != null) { T.push(["fd", base - fd, 5]); if (ex != null) T.push(["fdx", base - fd + ex, 6], ["fdx", base - fd - ex, 6]); }
+    const hit = T.find(t => nr(t[1], P, t[2])); out.pbt = !!hit; if (hit && hit[0]) out.pbtHow = hit[0];
+  }
+  if (v("pbt") != null && v("tax") != null && v("net_profit") != null) {
+    const base = v("pbt") - v("tax"), N = v("net_profit"), sh = has("share_associates") ? v("share_associates") : null, T = [["", base, 3]]; if (sh != null) T.push(["s", base + sh, 4]);
+    const hit = T.find(t => nr(t[1], N, t[2])); out.np = !!hit; if (hit && hit[0]) out.npHow = hit[0];
+  }
+  return out;
+}
+// pageOf(n) = the text of attached page n as the reader gave it; cands (optional) = [{ p, text }] every attached page: a column
+// whose numbers are not on its stated page is looked for on the others — the whole column on ONE page.
+export function check(statements, pageOf, cands) {
+  let found = 0, total = 0, cols = 0, okCols = 0;
   for (const s of statements || []) {
     s.factor = unitFactor(s.unit);
+    const hits = [];
     for (const c of s.columns || []) {
-      const txt = pageOf(c.page); c.onPage = {};
-      for (const f of FIELDS) { if (c[f] == null) continue; total++; c.onPage[f] = onRow(c[f], txt, f); if (c.onPage[f]) found++; }
-      const near = (x, y) => x != null && y != null && Math.abs(x - y) <= Math.max(1.5, Math.abs(y) * 0.003);
-      c.sums = { income: c.total_income == null || c.revenue == null ? null : near((+c.revenue) + (+c.other_income || 0), +c.total_income),
-        pbt: c.total_income == null || c.total_expenses == null || c.pbt == null ? null : near(+c.total_income - +c.total_expenses, +c.pbt),
-        np: c.pbt == null || c.tax == null || c.net_profit == null ? null : near(+c.pbt - +c.tax, +c.net_profit) };
+      const need = FIELDS.filter(f => c[f] != null).length; let best = colHits(c, pageOf(c.page)), at = null;
+      if (best.n < need && cands) for (const k of cands) { const r = colHits(c, k.text); if (r.n > best.n) { best = r; at = k.p; } }
+      if (at != null) c.page = at;
+      hits.push(best); total += need; found += best.n;
+    }
+    const vals = (s.columns || []).flatMap(c => FIELDS.filter(f => f !== "eps_basic" && c[f] != null).map(f => { const t = String(c[f]), i = t.indexOf("."); return i < 0 ? 0 : t.length - i - 1; }));
+    const d = Math.min(4, Math.max(0, ...hits.map(h => h.dec), ...vals));           // decimals as printed in this table
+    (s.columns || []).forEach((c, i) => { const h = hits[i]; c.onPage = h.on; c.rows = h.rows; if (Object.keys(h.miss).length) c.miss = h.miss; else delete c.miss;
+      c.sums = sumsOf(c, h.on, d);
+      // a statement called consolidated must say so on its page (a standalone table must never be shown as consolidated)
+      const bOk = !/^cons/i.test(String(s.basis || "")) || /consolidated/i.test(cands ? (cands.find(k => k.p === c.page) || { text: pageOf(c.page) }).text : pageOf(c.page));
       // shown only when sales, total income and profit are each in their own row on the page, sales + other income = total
       // income, no other total disagrees and the unit is clear
-      c.ok = !!(s.factor && c.onPage.revenue && c.onPage.total_income && c.onPage.net_profit && c.sums.income === true && c.sums.np !== false && c.sums.pbt !== false);
-    }
+      c.ok = !!(s.factor && bOk && h.on.revenue && h.on.total_income && h.on.net_profit && c.sums.income === true && c.sums.np !== false && c.sums.pbt !== false);
+      if (c.sums.pbtHow && /^fd/.test(c.sums.pbtHow)) c.teEx = 1; else delete c.teEx;      // "total expenses" printed before finance costs and depreciation
+      c.why = c.ok ? undefined : !s.factor ? "unit" : !bOk ? "basis" : c.revenue == null ? "no sales" : !h.on.revenue ? "sales row" : c.total_income == null ? "no total income" : !h.on.total_income ? "total income row"
+        : c.net_profit == null ? "no profit" : !h.on.net_profit ? "profit row" : c.sums.income !== true ? "income sum" : c.sums.pbt === false ? "pbt sum" : "profit sum";
+      if (c.why === undefined) delete c.why; cols++; if (c.ok) okCols++; });
+    s.dec = d;
   }
-  return { found, total };
+  return { found, total, cols, ok: okCols };
 }
-const SYSTEM = "You read the financial results PDFs of Indian listed companies. Answer with JSON only. Copy every number exactly as printed in the table (same unit, no conversion, no rounding); write negatives / numbers in brackets with a minus sign; never guess — use null when a line is not printed.";
+const SYSTEM = "You read the financial results PDFs of Indian listed companies. Answer with JSON only. Copy every number exactly as printed in the table (same unit, same decimals, no conversion, no rounding); write negatives / numbers in brackets with a minus sign; never guess — use null when a line is not printed.";
 const prompt = (co, pages) => `The attached document holds pages ${pages.map(p => p + 1).join(", ")} of the results PDF of ${co.name} (BSE code ${co.scrip}), in that order.
 Find the statement(s) of financial results (profit and loss). For EACH statement present (standalone and/or consolidated) return every column of the table (this quarter, previous quarter, same quarter last year, half-years, year):
-{"statements":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. Rs. in Lakhs","columns":[{"label":"as printed","end":"YYYY-MM-DD","months":3|6|9|12,"page":<1-based page of the ATTACHED document>,"revenue":n,"other_income":n,"total_income":n,"total_expenses":n,"finance_costs":n,"depreciation":n,"pbt":n,"tax":n,"net_profit":n,"eps_basic":n}]}]}
-revenue = revenue from operations (or income from operations); pbt = profit before tax; tax = total tax expense; net_profit = profit for the period after tax; eps_basic = basic EPS in rupees. If there is no results table, answer {"statements":[]}.`;
+{"statements":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. Rs. in Lakhs","columns":[{"label":"as printed","end":"YYYY-MM-DD","months":3|6|9|12,"page":<position of the page in the ATTACHED document: 1 = its first page>,"revenue":n,"other_income":n,"total_income":n,"total_expenses":n,"finance_costs":n,"depreciation":n,"exceptional":n,"share_associates":n,"pbt":n,"tax":n,"net_profit":n,"eps_basic":n}]}]}
+revenue = revenue from operations (or income from operations; for a finance company "total revenue from operations"); total_income = revenue + other income, as printed; total_expenses = the "total expenses" line as printed; exceptional = exceptional items (null if none); share_associates = share of profit/(loss) of associates and joint ventures (null if none); pbt = profit before tax (after exceptional items); tax = total tax expense; net_profit = profit for the period after tax; eps_basic = basic EPS in rupees. If there is no results table (for example a press release or a newspaper extract), answer {"statements":[]}.`;
+export const RV = 3;                                    // version of the reader's checks (older readings are read again once)
 
 async function main() {
   if (!KEY || !CKEY) { log("Pilot: TREX_KEY or ANTHROPIC_API_KEY missing — nothing done."); return; }
+  const until = Date.now() + Math.max(3, +(process.env.TREX_BSEPILOT_MINUTES || 22)) * 60e3;      // the job has 30 minutes: no new PDF after this
   // first the PDFs read by an older version of these checks (read again), then new ones
   const re = await trex("bsepdfs", "&redo=1&n=" + N).then(r => r.json()).catch(() => ({ rows: [] }));
   const tg = await trex("bsepdfs", "&n=" + N).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
   if (!tg.ok) { log("Pilot: could not get the list from T-Rex: " + (tg.error || "?")); process.exitCode = 1; return; }
   tg.rows = [...(re.rows || []), ...tg.rows];
   let spent = +tg.spent || 0, spentM = +tg.spentMonth || 0; log(`BSE PDFs: ${tg.rows.length} to read; spent so far $${spent.toFixed(4)} of $${CAP}${MCAP ? `, this month $${spentM.toFixed(4)} of $${MCAP}` : ""}.`);
-  const st = {}; let k = 0;
+  const st = {}; let k = 0, docs = 0, passed = 0;
   for (const co of tg.rows) {
     k++; if (spent >= CAP - 0.05 || (MCAP && spentM >= MCAP - 0.05)) { log(`BSE PDFs: budget reached ($${spent.toFixed(4)} in total, $${spentM.toFixed(4)} this month) — stopping.`); break; }
-    const dir = await mkdtemp(join(tmpdir(), "bsep-")); const id = `doc ${k}`;
+    if (Date.now() > until) { log(`BSE PDFs: time is up — ${tg.rows.length - k + 1} left for the next run.`); break; }
+    const dir = await mkdtemp(join(tmpdir(), "bsep-")); const id = `doc ${k}`, c0 = st.cost || 0; let counted = false;
     try {
-      const got = await getPdf(co.pdf); if (!got) { log(`  ${id}: could not download`); await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { err: "download failed" } }); continue; }
+      const got = await getPdf(co.pdf); if (!got) { log(`  ${id}: could not download`); await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { rv: RV, err: "download failed", again: 1 } }); continue; }
       const file = join(dir, "a.pdf"); await writeFile(file, got.b);
       const nPages = +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 1;
       const { pages, ocr } = await pageTexts(dir, file, nPages);
-      const pick = pickPages(pages);
+      const texts = pages.map(t => [t || ""]), joined = i => (texts[i] || []).filter(Boolean).join("\n");       // per page: the PDF's own text, then OCR readings
+      // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): the first
+      // pages are read by OCR as well, so the right pages are found
+      if (!pages.some(t => kwScore(t) >= 2)) for (let i = 0; i < Math.min(nPages, 16) && Date.now() < until; i++) { if (ocr.includes(i + 1)) continue;
+        const t = await ocrPage(dir, file, i, 220, 6); if (t.replace(/\s+/g, "").length > 50) { texts[i].push(t); ocr.push(i + 1); } }
+      const pick = pickPages(texts.map((_, i) => joined(i)));
       const parts = []; for (const p of pick) { await sh("pdfseparate", ["-f", String(p + 1), "-l", String(p + 1), file, join(dir, "s-%d.pdf")]); parts.push(join(dir, `s-${p + 1}.pdf`)); }
       const sub = join(dir, "sub.pdf"); if (parts.length > 1) await sh("pdfunite", [...parts, sub]); else await writeFile(sub, await readFile(parts[0]));
-      const c0 = st.cost || 0;
       const ans = await askClaude(fetch, CKEY, SYSTEM, [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: (await readFile(sub)).toString("base64") } }, { type: "text", text: prompt(co, pick) }], null, st);
-      const cost = (st.cost || 0) - c0; spent += cost; spentM += cost;
+      const cost = (st.cost || 0) - c0; spent += cost; spentM += cost; counted = true;
       let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
       const statements = (j && Array.isArray(j.statements)) ? j.statements.slice(0, 4) : [];
-      const pageOf = n => pages[pick[Math.max(0, Math.min(pick.length - 1, Math.round(+n || 1) - 1))]] || "";
-      const ck = check(statements, pageOf);
-      for (const s of statements) for (const c of s.columns || []) c.page = (pick[Math.max(0, Math.min(pick.length - 1, Math.round(+c.page || 1) - 1))] ?? 0) + 1;   // page of the original PDF
+      const at = n => pick[Math.max(0, Math.min(pick.length - 1, Math.round(+n || 1) - 1))] ?? 0;
+      const pageOf = n => joined(at(n)), cands = () => pick.map((p, x) => ({ p: x + 1, text: joined(p) }));
+      let ck = check(statements, pageOf, cands()); const wit = [];
+      // a key number not found in its row: the attached pages are read again by OCR (sharper, then as columns) — more witnesses
+      // of what is printed, never a looser check
+      for (const [dpi, psm] of [[300, 6], [300, 4]]) {
+        if (Date.now() > until || !statements.some(s => (s.columns || []).some(c => !c.ok && c.miss && KEYF.some(f => c.miss[f])))) break;
+        for (const p of pick) { const t = await ocrPage(dir, file, p, dpi, psm); if (t) texts[p].push(t); }
+        wit.push(dpi + "/" + psm); ck = check(statements, pageOf, cands());
+      }
+      for (const s of statements) for (const c of s.columns || []) c.page = at(c.page) + 1;   // page of the original PDF
       const ok = statements.some(s => (s.columns || []).some(c => c.ok));
-      await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, model: ans.model, cost, ok, data: { rv: 2, via: got.via, pages: nPages, read: pick.map(p => p + 1), ocr, statements, found: ck.found, numbers: ck.total } });
-      log(`  ${id}: ${nPages} pages (${ocr.length ? "scanned, read by OCR" : "text"}), ${statements.length} statement(s), ${ck.found} of ${ck.total} numbers found on the page — $${cost.toFixed(4)}`);
-    } catch (e) { log(`  ${id}: ${String(e.message || e).slice(0, 140)}`); if (e.fatal) break; }
+      await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, model: ans.model, cost, ok, data: { rv: RV, via: got.via, pages: nPages, read: pick.map(p => p + 1), ocr, wit, statements, found: ck.found, numbers: ck.total, cols: ck.cols, okCols: ck.ok } });
+      docs++; if (ok) passed++;
+      log(`  ${id}: ${nPages} pages (${ocr.length ? "scanned / pictures, read by OCR" : "text"}), ${statements.length} statement(s), ${ck.found} of ${ck.total} numbers found in their rows, ${ck.ok} of ${ck.cols} columns passed${wit.length ? ` (read again by OCR ${wit.length}×)` : ""} — $${cost.toFixed(4)}`);
+    } catch (e) { const cost = Math.max(0, (st.cost || 0) - c0); if (!counted) { spent += cost; spentM += cost; }
+      log(`  ${id}: ${String(e.message || e).replace(/https?:\/\/\S+/g, "[link]").slice(0, 140)}`); if (e.fatal) break;
+      // a read that failed (busy, no answer…): its cost is counted and T-Rex offers the PDF again — three tries at most
+      try { await trex("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost, data: { rv: RV, err: "reading failed", again: 1 } }); } catch (x) {} }
     finally { await rm(dir, { recursive: true, force: true }); }
   }
-  log(`Pilot: done. Spent this run $${(st.cost || 0).toFixed(4)}; in total about $${spent.toFixed(4)} of $${CAP}.`);
+  log(`Pilot: done — ${passed} of ${docs} PDFs gave figures that passed every check. Spent this run $${(st.cost || 0).toFixed(4)}; in total about $${spent.toFixed(4)} of $${CAP}.`);
 }
 if (process.argv[1] && process.argv[1].endsWith("bsepilot.mjs")) main();

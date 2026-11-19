@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { pathToFileURL } from "node:url";
 import { askClaude, salvageJson } from "./insights.mjs";
-import { pageTexts, onPage, unitFactor } from "./bsepilot.mjs";
+import { pageTexts, onPage, unitFactor, readPdf } from "./bsepilot.mjs";
 
 const server = (process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, "");
 const KEY = process.env.TREX_KEY || "", CKEY = process.env.ANTHROPIC_API_KEY || "";
@@ -105,19 +105,54 @@ Find the ${basis === "S" ? "STANDALONE" : "CONSOLIDATED"} statement of financial
 {"statements":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. ₹ in Crores","columns":[{"label":"as printed","end":"YYYY-MM-DD","months":3|6|9|12,"page":<1-based page of the ATTACHED document>,"revenue":n,"other_income":n,"total_income":n,"total_expenses":n,"finance_costs":n,"depreciation":n,"pbt":n,"tax":n,"np_cont":n,"np_disc":n,"net_profit":n,"np_owners":n,"eps_basic":n}]}]}
 revenue = revenue from operations of the continuing operations; total_income, total_expenses, finance_costs, depreciation, pbt (profit before tax) and tax (total tax expense) = continuing operations; np_cont = profit after tax from continuing operations; np_disc = profit after tax from discontinued operations (null if none); net_profit = profit for the period from continuing AND discontinued operations; np_owners = profit attributable to owners of the parent (null if not printed); eps_basic = basic EPS for continuing and discontinued operations, in rupees. If there is no such table, answer {"statements":[]}.`;
 
+// (19 Nov 2026) NEW LISTINGS: the first live runs read 10 of their Results PDFs and kept none ("no results table found" — the
+// tables are scanned pictures — or "current quarter did not pass"). They are now read with the BSE reader's proven tools
+// (bsepilot.mjs readPdf: first six pages always shown, OCR witnesses 220/300 dpi, sideways scans, picture fallback for big
+// scans, a column looked for on the other pages, arithmetic to rounding, one more reading told what failed). Only columns that
+// passed EVERY one of those checks are turned into T-Rex's figures (₹ crore) — and T-Rex keeps them only when the current
+// quarter equals the company's NSE filing (rsfig).
+export function gapCols(statements, basis, qe) {
+  const want = basis === "S" ? /stand/i : /cons/i, s0 = (statements || []).find(s => want.test(String(s.basis || ""))) || null;
+  const out = { cur: null, cols: [] }; if (!s0) return out; const f = unitFactor(s0.unit); if (!f) return out;
+  for (const c of s0.columns || []) {
+    const end = String(c.end || ""), m = +c.months || null, on = c.onPage || {}; if (!c.ok || !/^\d{4}-\d{2}-\d{2}$/.test(end)) continue;
+    const v = k => c[k] == null || c[k] === "" || !isFinite(+c[k]) ? null : +c[k], cf = k => v(k) == null || !on[k] ? null : Math.round(v(k) * f * 100) / 100;
+    const fd = c.teEx ? 0 : v("finance_costs") == null || v("depreciation") == null || !on.finance_costs || !on.depreciation ? null : v("finance_costs") + v("depreciation");   // EBIDT only when both lines are confirmed on the page
+    const op = cf("revenue") != null && cf("total_expenses") != null && fd != null ? Math.round((v("revenue") - v("total_expenses") + fd) * f * 100) / 100 : null;
+    const row = { months: m, sales: cf("revenue"), op, oi: cf("other_income"), interest: cf("finance_costs"), dep: cf("depreciation"), pbt: cf("pbt"), tax: cf("tax"), np: cf("net_profit"), own: null, eps: on.eps_basic ? v("eps_basic") : null };
+    if (row.sales == null || row.np == null) continue;
+    let key = null;
+    if (m === 3 && end === qe) out.cur = row;
+    else if (m === 3 && (end === qeAdd(qe, -3) || end === qeAdd(qe, -12))) key = end;
+    else if (m > 3 && m < 12 && end === qe) key = "ytd0"; else if (m > 3 && m < 12 && end === qeAdd(qe, -12)) key = "ytd1";
+    else if (m === 12 && end < qe && end >= qeAdd(qe, -12)) key = "fy1";
+    if (key) out.cols.push({ qe: key, ...row });
+  }
+  return out;
+}
 async function main() {
   if (!KEY || !CKEY) { log("Restated quarters: TREX_KEY or ANTHROPIC_API_KEY missing — nothing done."); return; }
   if (!(CAP > 0)) { log("Restated quarters: no budget set (TREX_RS_BUDGET_USD) — nothing done."); return; }
   const tg = await trex("rstargets", "&n=" + N).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
   if (!tg.ok) { log("Restated quarters: could not get the list from T-Rex: " + (tg.error || "?")); process.exitCode = 1; return; }
   let spent = +tg.spent || 0, spentM = +tg.spentMonth || 0; log(`Restated quarters: ${tg.rows.length} Results PDFs to read; spent so far $${spent.toFixed(4)} of $${CAP}${MCAP ? `, this month $${spentM.toFixed(4)} of $${MCAP}` : ""}.`);
-  const st = {}; let k = 0, kept = 0;
+  const st = {}; let k = 0, kept = 0; const until = Date.now() + Math.max(1, +(process.env.TREX_RS_MINUTES || 22)) * 60e3;   // the job has 30 minutes
   for (const row of tg.rows) {
+    if (Date.now() > until) { log(`Restated quarters: time is up — ${tg.rows.length - k} left for the next run.`); break; }
     k++; if (spent >= CAP - 0.05 || (MCAP && spentM >= MCAP - 0.05)) { log(`Restated quarters: budget reached ($${spent.toFixed(4)} in total, $${spentM.toFixed(4)} this month) — stopping.`); break; }
     const dir = await mkdtemp(join(tmpdir(), "rsr-")), id = `doc ${k}`, c0 = st.cost || 0; let cost = 0;
     try {
       const pdf = await getNsePdf(row.pdf); if (!pdf) { log(`  ${id}: could not download`); await trex("rsfig", "", { symbol: row.symbol, basis: row.basis, qe: row.qe, ok: false, cost: 0, err: "download failed" }); continue; }
       const file = join(dir, "a.pdf"); await writeFile(file, pdf);
+      if (row.gap) {                                                    // a new listing: the BSE reader's tools (see gapCols)
+        const R = await readPdf(dir, file, { name: row.name || row.symbol, code: "NSE " + row.symbol, scrip: row.symbol }, (sys, content, stt) => askClaude(fetch, CKEY, sys, content, null, stt), st, Math.min(until, Date.now() + 8 * 60e3));
+        cost = (st.cost || 0) - c0; spent += cost; spentM += cost;
+        const g = gapCols(R.best.statements, row.basis, row.qe), ok = !!(g.cur && g.cols.some(c => (row.want || []).includes(c.qe)));
+        const r = await trex("rsfig", "", { symbol: row.symbol, basis: row.basis, qe: row.qe, ok, cost, model: R.best.model, cur: g.cur, cols: g.cols, err: ok ? null : (!R.best.statements.length ? "no results table found in the PDF" : !g.cur ? "current quarter did not pass the checks" : "no earlier quarter passed the checks") }).then(x => x.json()).catch(() => null);
+        if (r && r.kept && r.kept.length) kept++;
+        log(`  ${id}: new listing, ${R.nPages} pages${R.ocr.length ? " (scanned / pictures, read by OCR)" : ""}, ${R.best.ck.ok} of ${R.best.ck.cols} columns passed${R.tries > 1 ? " (read twice)" : ""} — ${r && r.kept && r.kept.length ? "kept" : "not kept"} · $${cost.toFixed(4)}`);
+        continue;
+      }
       const nPages = +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 1;
       const { pages } = await pageTexts(dir, file, nPages);
       const pick = rsPick(pages, row.basis); if (!pick.length) { log(`  ${id}: no results table found`); await trex("rsfig", "", { symbol: row.symbol, basis: row.basis, qe: row.qe, ok: false, cost: 0, err: "no results table found in the PDF" }); continue; }

@@ -174,7 +174,7 @@ export function check(statements, pageOf, cands) {
   return { found, total, cols, ok: okCols };
 }
 const SYSTEM = "You read the financial results PDFs of Indian listed companies. Answer with JSON only. Copy every number exactly as printed in the table (same unit, same decimals, no conversion, no rounding); write negatives / numbers in brackets with a minus sign; never guess — use null when a line is not printed.";
-const prompt = (co, pages) => `The attached document holds pages ${pages.map(p => p + 1).join(", ")} of the results PDF of ${co.name} (BSE code ${co.scrip}), in that order.
+const prompt = (co, pages) => `The attached document holds pages ${pages.map(p => p + 1).join(", ")} of the results PDF of ${co.name} (${co.code || "BSE code " + co.scrip}), in that order.
 Find the statement(s) of financial results (profit and loss). For EACH statement present (standalone and/or consolidated) return every column of the table (this quarter, previous quarter, same quarter last year, half-years, year):
 {"statements":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. Rs. in Lakhs","columns":[{"label":"as printed","end":"YYYY-MM-DD","months":3|6|9|12,"page":<position of the page in the ATTACHED document: 1 = its first page>,"revenue":n,"other_income":n,"total_income":n,"total_expenses":n,"finance_costs":n,"depreciation":n,"exceptional":n,"share_associates":n,"pbt":n,"tax":n,"net_profit":n,"eps_basic":n}]}]}
 revenue = revenue from operations (or income from operations; for a finance company "total revenue from operations"); total_income = revenue + other income, as printed; total_expenses = the "total expenses" line as printed; exceptional = exceptional items (null if none); share_associates = share of profit/(loss) of associates and joint ventures (null if none); pbt = profit before tax (after exceptional items); tax = total tax expense; net_profit = profit for the period after tax; eps_basic = basic EPS in rupees. If there is no results table (for example a press release or a newspaper extract), answer {"statements":[]}.`;
@@ -228,6 +228,52 @@ export function restorePrev(prev, pick) {
 const okCols = S => (S || []).reduce((n, s) => n + (s.columns || []).filter(c => c.ok).length, 0);
 
 // o: stand-ins for a trial run without the network (trex, ask, getPdf, log, minutes)
+// (19 Nov 2026) the reading of ONE results PDF — pages, OCR witnesses, the reading, every check, the earlier reading, one more
+// reading when nothing passed — shared by this BSE-only reader and rsread.mjs (new listings' year-ago quarter on NSE)
+export async function readPdf(dir, file, co, ask, st, until, o = {}) {
+  const { pages, ocr } = await pageTexts(dir, file, +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 0), nPages = pages.length;
+  const texts = pages.map(t => [t || ""]), joined = i => (texts[i] || []).filter(Boolean).join("\n");       // per page: the PDF's own text, then OCR readings
+  const allText = () => texts.map((_, i) => joined(i)), seen = new Set();
+  const ocrMore = async (from, to) => { for (let i = from; i < Math.min(nPages, to) && Date.now() < until; i++) { if (ocr.includes(i + 1) || (pages[i] || "").replace(/\s+/g, "").length >= 300 && kwScore(pages[i]) >= 1) continue;
+    const t = await ocrPage(dir, file, i, 220, 6); if (t.replace(/\s+/g, "").length > 50) { texts[i].push(t); ocr.push(i + 1); } } };
+  // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): pages 7–14 are
+  // read by OCR as well, to find a table further back (the first six pages are always shown to the reader)
+  if (!pages.some(t => kwScore(t) >= 2)) await ocrMore(6, 14);
+  const read = async (pick, hint) => { const doc = await attach(dir, file, pick, +o.maxPdf || MAXPDF);
+    const ans = await ask(SYSTEM, [...doc, { type: "text", text: prompt(co, pick) + (hint || "") }], st);
+    let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
+    return { pick, model: ans.model, statements: (j && Array.isArray(j.statements)) ? j.statements.slice(0, 4) : [] }; };
+  // every number in its own row on its page, totals to rounding; a key number not found → the pages of those columns are
+  // read again by OCR (sharper, then as columns): more witnesses of what is printed, never a looser check
+  const verify = async R => { const at = n => R.pick[Math.max(0, Math.min(R.pick.length - 1, Math.round(+n || 1) - 1))] ?? 0;
+    const pageOf = n => joined(at(n)), cands = () => R.pick.map((p, x) => ({ p: x + 1, text: joined(p) }));
+    R.at = at; R.ck = check(R.statements, pageOf, cands()); R.wit = 0;
+    // (18 Nov 2026, K G Denim) mode 1 finds the page's orientation itself: a table scanned SIDEWAYS is read the right way up
+    for (const [dpi, psm] of [[300, 6], [300, 4], [300, 1]]) {
+      if (Date.now() > until || !R.statements.some(s => (s.columns || []).some(c => !c.ok && c.miss && KEYF.some(f => c.miss[f])))) break;
+      const need = new Set(R.statements.flatMap(s => (s.columns || []).filter(c => !c.ok).map(c => at(c.page)))); let fresh = 0;
+      for (const p of need) { const key = p + "/" + dpi + "/" + psm; if (seen.has(key)) continue; seen.add(key); const t = await ocrPage(dir, file, p, dpi, psm); if (t) { texts[p].push(t); fresh++; } }
+      if (fresh) { R.wit++; R.ck = check(R.statements, pageOf, cands()); }
+    }
+    return R; };
+  const pick = pickPages(allText());
+  let best = await verify(await read(pick)), tries = 1, from = null; const first = best;
+  // (v6) the reading T-Rex already has for this PDF is checked again by today's rules — a new reading never replaces a
+  // better one (seen 18 Nov 2026: read again, a PDF that had passed came back with "total income" as sales)
+  if (co.prev && Date.now() < until) { const pk = [...new Set([...pick, ...co.prev.flatMap(s => (s.columns || []).map(c => (+c.page || 1) - 1))])].filter(p => p >= 0 && p < nPages).sort((a, b) => a - b);
+    const P = await verify({ pick: pk, model: co.prevModel || null, statements: restorePrev(co.prev, pk) }); if (P.ck.ok > best.ck.ok) { best = P; from = "earlier reading"; } }
+  // (v6) nothing passed: ONE more reading — told in plain words which check failed, and, for a long PDF, shown the pages a
+  // deeper search finds (scanned pages after page 12 are read by OCR only now)
+  if (!best.ck.ok && Date.now() < until) {
+    let pick2 = pick;
+    if (nPages > 12) { await ocrMore(12, 40);
+      const kw = allText().map((t, i) => ({ i, s: kwScore(t) })).filter(x => x.s >= 2 && !pick.includes(x.i)).sort((a, b) => b.s - a.s).slice(0, 5).map(x => x.i);
+      if (kw.length) pick2 = [...new Set([...kw, ...first.statements.flatMap(s => (s.columns || []).map(c => first.at(c.page)))])].slice(0, 8).sort((a, b) => a - b); }
+    const fb = feedback(first.statements);
+    if (fb.length || pick2 !== pick) { const R2 = await verify(await read(pick2, hintOf(fb))); tries++; if (R2.ck.ok > best.ck.ok || (!best.statements.length && R2.statements.length)) { best = R2; from = "second reading"; } }
+  }
+  return { best, nPages, ocr, tries, from };
+}
 export async function run(o = {}) {
   const T = o.trex || trex, ask = o.ask || ((sys, content, stt) => askClaude(fetch, CKEY, sys, content, null, stt)), get = o.getPdf || getPdf, say = o.log || log;
   const until = Date.now() + Math.max(1, +(o.minutes || process.env.TREX_BSEPILOT_MINUTES || 22)) * 60e3;      // the job has 30 minutes: no new PDF after this
@@ -245,47 +291,7 @@ export async function run(o = {}) {
     try {
       const got = await get(co.pdf); if (!got) { say(`  ${id}: could not download`); await T("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { rv: RV, arv: RV, err: "download failed", again: 1 } }); continue; }
       const file = join(dir, "a.pdf"); await writeFile(file, got.b);
-      const { pages, ocr } = await pageTexts(dir, file, +((await sh("pdfinfo", [file]).catch(() => "")).match(/Pages:\s+(\d+)/) || [0, 0])[1] || 0), nPages = pages.length;
-      const texts = pages.map(t => [t || ""]), joined = i => (texts[i] || []).filter(Boolean).join("\n");       // per page: the PDF's own text, then OCR readings
-      const allText = () => texts.map((_, i) => joined(i)), seen = new Set();
-      const ocrMore = async (from, to) => { for (let i = from; i < Math.min(nPages, to) && Date.now() < until; i++) { if (ocr.includes(i + 1) || (pages[i] || "").replace(/\s+/g, "").length >= 300 && kwScore(pages[i]) >= 1) continue;
-        const t = await ocrPage(dir, file, i, 220, 6); if (t.replace(/\s+/g, "").length > 50) { texts[i].push(t); ocr.push(i + 1); } } };
-      // (v3) no page of the PDF's own text shows a results table (it is a picture, or the text is unreadable): pages 7–14 are
-      // read by OCR as well, to find a table further back (the first six pages are always shown to the reader)
-      if (!pages.some(t => kwScore(t) >= 2)) await ocrMore(6, 14);
-      const read = async (pick, hint) => { const doc = await attach(dir, file, pick, +o.maxPdf || MAXPDF);
-        const ans = await ask(SYSTEM, [...doc, { type: "text", text: prompt(co, pick) + (hint || "") }], st);
-        let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
-        return { pick, model: ans.model, statements: (j && Array.isArray(j.statements)) ? j.statements.slice(0, 4) : [] }; };
-      // every number in its own row on its page, totals to rounding; a key number not found → the pages of those columns are
-      // read again by OCR (sharper, then as columns): more witnesses of what is printed, never a looser check
-      const verify = async R => { const at = n => R.pick[Math.max(0, Math.min(R.pick.length - 1, Math.round(+n || 1) - 1))] ?? 0;
-        const pageOf = n => joined(at(n)), cands = () => R.pick.map((p, x) => ({ p: x + 1, text: joined(p) }));
-        R.at = at; R.ck = check(R.statements, pageOf, cands()); R.wit = 0;
-        // (18 Nov 2026, K G Denim) mode 1 finds the page's orientation itself: a table scanned SIDEWAYS is read the right way up
-        for (const [dpi, psm] of [[300, 6], [300, 4], [300, 1]]) {
-          if (Date.now() > until || !R.statements.some(s => (s.columns || []).some(c => !c.ok && c.miss && KEYF.some(f => c.miss[f])))) break;
-          const need = new Set(R.statements.flatMap(s => (s.columns || []).filter(c => !c.ok).map(c => at(c.page)))); let fresh = 0;
-          for (const p of need) { const key = p + "/" + dpi + "/" + psm; if (seen.has(key)) continue; seen.add(key); const t = await ocrPage(dir, file, p, dpi, psm); if (t) { texts[p].push(t); fresh++; } }
-          if (fresh) { R.wit++; R.ck = check(R.statements, pageOf, cands()); }
-        }
-        return R; };
-      const pick = pickPages(allText());
-      let best = await verify(await read(pick)), tries = 1, from = null; const first = best;
-      // (v6) the reading T-Rex already has for this PDF is checked again by today's rules — a new reading never replaces a
-      // better one (seen 18 Nov 2026: read again, a PDF that had passed came back with "total income" as sales)
-      if (co.prev && Date.now() < until) { const pk = [...new Set([...pick, ...co.prev.flatMap(s => (s.columns || []).map(c => (+c.page || 1) - 1))])].filter(p => p >= 0 && p < nPages).sort((a, b) => a - b);
-        const P = await verify({ pick: pk, model: co.prevModel || null, statements: restorePrev(co.prev, pk) }); if (P.ck.ok > best.ck.ok) { best = P; from = "earlier reading"; } }
-      // (v6) nothing passed: ONE more reading — told in plain words which check failed, and, for a long PDF, shown the pages a
-      // deeper search finds (scanned pages after page 12 are read by OCR only now)
-      if (!best.ck.ok && Date.now() < until) {
-        let pick2 = pick;
-        if (nPages > 12) { await ocrMore(12, 40);
-          const kw = allText().map((t, i) => ({ i, s: kwScore(t) })).filter(x => x.s >= 2 && !pick.includes(x.i)).sort((a, b) => b.s - a.s).slice(0, 5).map(x => x.i);
-          if (kw.length) pick2 = [...new Set([...kw, ...first.statements.flatMap(s => (s.columns || []).map(c => first.at(c.page)))])].slice(0, 8).sort((a, b) => a - b); }
-        const fb = feedback(first.statements);
-        if (fb.length || pick2 !== pick) { const R2 = await verify(await read(pick2, hintOf(fb))); tries++; if (R2.ck.ok > best.ck.ok || (!best.statements.length && R2.statements.length)) { best = R2; from = "second reading"; } }
-      }
+      const { best, nPages, ocr, tries, from } = await readPdf(dir, file, co, ask, st, until, o);
       const cost = (st.cost || 0) - c0; spent += cost; spentM += cost; counted = true;
       const statements = best.statements, ck = best.ck;
       for (const s of statements) for (const c of s.columns || []) c.page = best.at(c.page) + 1;   // page of the original PDF

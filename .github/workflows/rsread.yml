@@ -29,6 +29,6 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
           TREX_KEY: ${{ secrets.TREX_KEY }}
-          TREX_RS_BUDGET_USD: "3"     # never more than this in total (about 1 cent a Results PDF)
-          TREX_RS_MONTH_USD: "1"      # and never more than this in one month
+          TREX_RS_BUDGET_USD: "6"     # never more than this in total (about 1 cent a Results PDF; 19 Nov 2026: + new listings, owner option B)
+          TREX_RS_MONTH_USD: "2"      # and never more than this in one month
           TREX_RS_N: "20"

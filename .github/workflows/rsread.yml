@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: 22
       - name: Install PDF and OCR tools
-        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils tesseract-ocr >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext && command -v pdfseparate && command -v pdfunite
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils tesseract-ocr tesseract-ocr-osd >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext && command -v pdfseparate && command -v pdfunite && command -v tesseract
       - name: Read the restated quarters (caps below)
         run: node collector/rsread.mjs
         env:
@@ -32,3 +32,4 @@ jobs:
           TREX_RS_BUDGET_USD: "6"     # never more than this in total (about 1 cent a Results PDF; 19 Nov 2026: + new listings, owner option B)
           TREX_RS_MONTH_USD: "2"      # and never more than this in one month
           TREX_RS_N: "20"
+          TREX_RS_MINUTES: "22"     # no new PDF is started after this (the job has 30 minutes; scanned PDFs take longer, 19 Nov 2026)

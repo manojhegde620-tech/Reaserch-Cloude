@@ -1,0 +1,33 @@
+# T-Rex · New ventures PILOT (owner's "go ahead", 20 Nov 2026): reads the latest call transcript + investor presentation of
+# 20 small/midcap companies (Time Technoplast and Ola Electric first) and lists their NEW business lines, each with a sentence
+# found on its page. Results go to T-Rex for Mr. T-Rex's review (/api/stepzero?what=vent). Run by hand only.
+# Money: T-Rex stops it at TREX_VENT_CAP ($1 by default) across all runs; this run also stops at TREX_VENT_BUDGET_USD.
+name: T-Rex new ventures pilot
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: trex-ventures
+  cancel-in-progress: false
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PDF text tool
+        run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext
+      - name: Find new business lines (pilot, caps below)
+        run: node collector/ventures.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
+          TREX_KEY: ${{ secrets.TREX_KEY }}
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TREX_VENT_BUDGET_USD: "1"
+          TREX_VENT_N: "20"
+          TREX_VENT_SYMS: "TIMETECHNO,OLAELEC"

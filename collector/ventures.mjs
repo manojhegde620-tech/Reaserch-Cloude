@@ -17,6 +17,10 @@ import { openText } from "./seal.mjs";
 
 export const VENT_THEMES = ["hydrogen_gas", "ev_batteries", "defence_aerospace", "semiconductors_electronics", "solar_green_power", "railways", "data_centres", "medical_devices", "speciality_chemicals", "other"];
 export const VENT_STAGES = ["talked", "approval", "partner", "money", "first_order", "production", "in_numbers"];
+// (pilot v2, 20 Nov 2026 — the first run's noise: new brands in an existing range, equipment a hospital bought, a wealth manager's new
+// fund tagged "defence") the reader must say what kind of newness it is and the company's role; only real new businesses it makes or sells are kept
+export const VENT_KINDS = ["new_business", "new_technology", "new_market", "new_variant"];
+export const VENT_ROLES = ["maker_seller", "user", "investor_financier"];
 const KW = /new (product|business|segment|vertical|venture|technolog|line|market|categor|geograph)|foray|diversif|forward integration|backward integration|enter(ed|ing|s)? (into|the)|launch|pilot|prototype|trials?\b|approval|certif|PESO|\bBIS\b|DGCA|RDSO|DRDO|qualif|validat|\bMoU\b|tie-?up|collaborat|partnership|joint venture|\bJV\b|subsidiar|greenfield|capex|new plant|commission|first order|maiden order|hydrogen|batter|\bcells?\b|semiconductor|defen[cs]e|drone|solar|electroly|\bEVs?\b|electric vehicle|data cent|CDMO|green ammonia|biofuel|ethanol|export/gi;
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const REF = "https://www.nseindia.com/companies-listing/corporate-filings-announcements";
@@ -43,29 +47,41 @@ For each line:
    certification, regulatory approval received), partner (technology tie-up, JV, MoU signed), money (capex approved, plant or subsidiary
    set up for it), first_order (an order or named customer won), production (commercial production / supplies started),
    in_numbers (revenue or volume of this line stated),
+ "kind": new_business (a business or product category the company was not in before), new_technology (a new technology it will make or sell),
+   new_market (an existing product sold into a clearly new industry or customer group), new_variant (a new brand, model, size or SKU inside a
+   category it already sells — these are NOT new business lines),
+ "role": maker_seller (the company will make or sell it), user (it buys or uses it for its own operations — e.g. a hospital's new machine),
+   investor_financier (it invests in, lends to or runs a fund for it),
  "what": one plain sentence of what it is (your words, max 30 words),
  "quote": the sentence from the page that proves the stage, COPIED word-for-word (10–45 words),
  "page": the PAGE number of that sentence,
  "nums": numbers written in that same sentence about this line (capex, capacity, order value, revenue, target date): [{"v":"110","u":"Rs Cr","what":"capex"}].
 Rules: copy the quote exactly; never invent; if nothing new is described reply {"lines":[]}; at most 8 lines.
-Reply as {"lines":[{"line":"","theme":"","stage":"","what":"","quote":"","page":0,"nums":[]}]}
+Reply as {"lines":[{"line":"","kind":"","role":"","theme":"","stage":"","what":"","quote":"","page":0,"nums":[]}]}
 ${sel.map(p => `\n=== PAGE ${p.page} ===\n${p.text}`).join("\n")}`;
   return { system, prompt };
 }
 // keep a line only when its quote is found in the document; numbers only when written in that quote
 export function ventVerify(text, pagesSets, doc) {
   let j = null; try { j = JSON.parse(String(text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(text); }
-  const raw = j && Array.isArray(j.lines) ? j.lines : [], out = [];
+  const raw = j && Array.isArray(j.lines) ? j.lines : [], out = []; let dropped = 0;
   const digits = s => String(s || "").replace(/[,\s]/g, "");
   for (const x of raw) {
     if (!x || !x.line || !x.quote) continue;
+    if (x.role !== "maker_seller" || !["new_business", "new_technology", "new_market"].includes(x.kind)) { dropped++; continue; }   // only real new businesses the company makes or sells
     const f = findQuote(x.quote, x.page, pagesSets); if (!f) continue;
     const q = digits(f.quote);
     out.push({ line: String(x.line).slice(0, 90), theme: VENT_THEMES.includes(x.theme) ? x.theme : "other", stage: VENT_STAGES.includes(x.stage) ? x.stage : "talked",
+      kind: VENT_KINDS.includes(x.kind) ? x.kind : null, role: VENT_ROLES.includes(x.role) ? x.role : null,
       what: String(x.what || "").slice(0, 240), quote: f.quote, page: f.page, doc: doc.url, type: doc.type, date: doc.date,
       nums: (Array.isArray(x.nums) ? x.nums : []).filter(n => n && n.v != null && String(n.v).trim() && q.includes(digits(n.v))).slice(0, 6) });
   }
-  return { raw: raw.length, lines: out };
+  // the same line said twice (e.g. "LFP cells" and "Own LFP cell production"): the furthest step is kept
+  const key = l => l.line.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(w => w.length > 2 && !/^(own|new|the|and|for|with|production|products?|business|systems?)$/.test(w)).sort().join(" ");
+  const keep = [];
+  for (const l of out) { const k = key(l), i = keep.findIndex(m => { const a = new Set(key(m).split(" ")), b = k.split(" "); return b.length && b.filter(w => a.has(w)).length / Math.max(1, Math.min(a.size, b.length)) >= 0.75; });
+    if (i < 0) keep.push(l); else if (VENT_STAGES.indexOf(l.stage) > VENT_STAGES.indexOf(keep[i].stage)) keep[i] = l; }
+  return { raw: raw.length, dropped, lines: keep };
 }
 
 async function main() {
@@ -99,19 +115,19 @@ async function main() {
   const st = { inTok: 0, outTok: 0 }; let n = 0, kept = 0;
   for (const c of picked) {
     if ((st.cost || 0) >= budget) { log("New ventures pilot: this run's budget is used — stopping."); break; }
-    const c0 = st.cost || 0, lines = []; let raw = 0, model = "", err = null;
+    const c0 = st.cost || 0, lines = []; let raw = 0, dropped = 0, model = "", err = null;
     for (const d of c.docs) {
       const buf = await getPdf(d.doc); if (!buf) { err = "could not download a document"; continue; }
       let pages = [], pagesRaw = null; try { pages = await pdfTextPoppler(buf); pagesRaw = await pdfTextPoppler(buf, false); } catch (e) { err = "PDF unreadable"; continue; }
       const sel = ventPages(pages); if (!sel.length) continue;
       const { system, prompt } = ventPrompt(c.name, c.s, d.type, d.date, sel);
       let ans; try { ans = await askClaude(fetch, CKEY, system, prompt, null, st); } catch (e) { err = String(e.message || e).slice(0, 100); if (e.fatal || e.config) { log("New ventures pilot: Claude key problem — stopping."); return; } continue; }
-      model = ans.model; const v = ventVerify(ans.text, [pagesRaw, pages], { url: d.doc, type: d.type, date: d.date }); raw += v.raw;
+      model = ans.model; const v = ventVerify(ans.text, [pagesRaw, pages], { url: d.doc, type: d.type, date: d.date }); raw += v.raw; dropped += v.dropped;
       for (const l of v.lines) if (!lines.some(x => x.line.toLowerCase() === l.line.toLowerCase())) lines.push(l);
     }
     const cost = Math.round(((st.cost || 0) - c0) * 1e5) / 1e5; n++; kept += lines.length;
-    const r = await trex("vent", "", { s: c.s, name: c.name, rank: rank.get(c.s) || null, docs: c.docs.map(d => ({ type: d.type, date: d.date })), lines, cost, model, raw, err });
-    log(`  company ${n}: ${lines.length} of ${raw} lines kept (quote found on the page), $${cost}`);
+    const r = await trex("vent", "", { s: c.s, name: c.name, rank: rank.get(c.s) || null, docs: c.docs.map(d => ({ type: d.type, date: d.date })), lines, cost, model, raw, dropped, err });
+    log(`  company ${n}: ${lines.length} of ${raw} lines kept (${dropped} not a new business it makes or sells; the rest: quote found on the page), $${cost}`);
     if (r && r.stop) { log("New ventures pilot: T-Rex says the cap is reached — stopping."); break; }
   }
   log(`New ventures pilot: ${n} companies, ${kept} lines kept, $${Math.round((st.cost || 0) * 1e4) / 1e4} this run.`);

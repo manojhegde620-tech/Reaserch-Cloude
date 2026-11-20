@@ -1,14 +1,15 @@
 # T-Rex · New ventures (owner 20 Nov 2026: pilot OK, then "go ahead - use 10$"): reads the call transcripts (last 2), latest investor
 # presentation and latest annual report (2025 onwards) of every small and midcap (market-value ranks 101–1000) and lists their NEW business
 # lines, each step with a sentence found on its page. Results go to T-Rex (Announcements → New ventures, Business tab).
-# Runs every hour until every company is read by this reader version (each run ~50 min, 4 at a time); a run with nothing left costs nothing.
+# Ran every hour until every company was read by this reader version (each run ~50 min, 4 at a time). All 900 were read by 20 Nov 2026 15:00 UTC,
+# so (owner: "after the run, set it to daily") it now runs once a day at 07:47 IST; a run with nothing left costs nothing.
 # Money: T-Rex stops it at TREX_VENT_CAP ($10.20 = the owner's $10 + the $0.10 pilot) across all runs (real cost ≈ $0.005 a company).
 # Clean-up (owner "yes, add the clean-up"): after each company, one short question over its saved lines folds repeats and hides
 # long-standing businesses (own cap $2, TREX_VENT_TIDY_CAP); companies read before the clean-up existed are done first in each run.
 name: T-Rex new ventures
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 2 * * *"
   workflow_dispatch:
 permissions:
   contents: read

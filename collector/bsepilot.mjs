@@ -88,9 +88,9 @@ const ROW = {
   tax: [/tax/i, /before tax|after tax/i], net_profit: [/profit|loss|\bPAT\b/i, /before tax|exceptional|discontinued|comprehensive|attributable|margin|\bPBT\b/i], eps_basic: [/basic|earnings? per share|eps/i] };
 // where is this number on the page, and is that line the right row?
 //   → { ok, label: the row's own words, dec: decimals as printed, near: the labels of other rows holding the number, or "absent" }
-export function rowHit(v, text, field) {
+export function rowHit(v, text, field, rules) {
   if (v == null || !isFinite(+v)) return { ok: false, near: "absent" };
-  const r = ROW[field], L = String(text || "").split(/\r?\n/).map(l => l.replace(/(\d),(?=\d)/g, "$1")), forms = numForms(v), near = [];
+  const r = (rules || ROW)[field], L = String(text || "").split(/\r?\n/).map(l => l.replace(/(\d),(?=\d)/g, "$1")), forms = numForms(v), near = [];
   const lab = l => String(l || "").replace(/[-\d.,()\s]+$/g, " ").replace(/\s+/g, " ").trim();
   for (let i = 0; i < L.length; i++) { let m = null; for (const re of forms) { m = re.exec(L[i]); if (m) break; } if (!m) continue;
     const tail = /^\.(\d+)/.exec(L[i].slice(m.index + m[0].length)), dec = Math.min(4, ((m[0].split(".")[1] || "").length) + (tail ? tail[1].length : 0));
@@ -202,7 +202,7 @@ export async function attach(dir, file, pick, max = MAXPDF) {
   if (!out.length) throw new Error("pages could not be prepared");
   return [{ type: "text", text: "The pages below are pictures, one per page, in the order of the page list in the request." }, ...out];
 }
-export const RV = 7;                                    // version of the reader's checks (older readings are read again once)
+export const RV = 8;                                    // (20 Nov 2026) 8: + balance sheet and cash flow                                    // version of the reader's checks (older readings are read again once)
 
 // ---- (v6) what the checks found wrong, in plain words — given to the reader for ONE more reading of the same pages. The second
 //      answer goes through exactly the same checks; nothing is accepted because the reader "says so".
@@ -272,8 +272,98 @@ export async function readPdf(dir, file, co, ask, st, until, o = {}) {
     const fb = feedback(first.statements);
     if (fb.length || pick2 !== pick) { const R2 = await verify(await read(pick2, hintOf(fb))); tries++; if (R2.ck.ok > best.ck.ok || (!best.statements.length && R2.statements.length)) { best = R2; from = "second reading"; } }
   }
-  return { best, nPages, ocr, tries, from };
+  return { best, nPages, ocr, tries, from, texts: texts.map((_, i) => joined(i)) };
 }
+
+// ---- (20 Nov 2026, owner's "full fix": "not only results — the entire fundamentals") the BALANCE SHEET (statement of assets and
+//      liabilities) and the CASH FLOW statement that companies attach to their September (half-year) and March (year) results.
+//      Read once more from the pages that hold them and checked exactly like the results table: every number in its own row on
+//      its page, the unit clear, and the statement's own totals must hold — total assets = total equity and liabilities, share
+//      capital + other equity = equity, operating + investing + financing = the net change in cash. Anything else is not shown.
+const BKW = /total assets|equity and liabilities|equity share capital|other equity|non[- ]?current assets|current liabilities|assets and liabilities/gi;
+const CKW = /cash flows?|operating activities|investing activities|financing activities|cash equivalents at the (end|beginning)/gi;
+export const bscfScore = t => ({ b: (String(t || "").match(BKW) || []).length, c: (String(t || "").match(CKW) || []).length });
+export function pickBsCf(pages) {
+  const s = (pages || []).map((t, i) => ({ i, ...bscfScore(t) }));
+  const b = s.filter(x => x.b >= 3).sort((x, y) => y.b - x.b).slice(0, 2).map(x => x.i), c = s.filter(x => x.c >= 3).sort((x, y) => y.c - x.c).slice(0, 2).map(x => x.i);
+  return [...new Set([...b, ...c])].sort((x, y) => x - y);
+}
+const ROWB = {
+  share_capital: [/share capital/i, /other equity|reserve/i], other_equity: [/other equity|reserves? (and|&) surplus/i, /share capital/i],
+  equity: [/equity attributable|total equity|shareholders'? funds|net worth/i, /liabilit|non[- ]?controlling|minority/i], nci: [/non[- ]?controlling|minority/i],
+  total_equity: [/total equity|shareholders'? funds/i, /liabilit/i],
+  borrowings_noncurrent: [/borrowing/i], borrowings_current: [/borrowing/i],
+  cash: [/cash and cash equivalent|cash & cash equivalent|^\W*(\w{1,4}[.)]\s*)?cash\W*$/i, /other bank|bank balances? other/i], other_bank: [/bank balance|other bank/i, /cash and cash equivalent/i],
+  current_investments: [/investment/i], inventories: [/inventor/i], trade_receivables: [/receivable/i], trade_payables: [/payable/i],
+  ppe: [/property,? plant|fixed assets|tangible assets/i, /capital work|intangible|right of use/i], cwip: [/capital work[- ]in[- ]progress|\bcwip\b/i],
+  goodwill: [/goodwill/i], intangibles: [/intangible/i, /under development|goodwill/i],
+  current_assets: [/current assets/i, /non[- ]?current|other current/i], current_liabilities: [/current liabilities/i, /non[- ]?current|other current/i],
+  total_assets: [/total assets/i], total_equity_liabilities: [/equity (and|&) liabilities|liabilities (and|&) equity/i] };
+const ROWC = { cfo: [/operating activit/i], cfi: [/investing activit/i], cff: [/financing activit/i],
+  net_change: [/net (increase|decrease|change|\()|increase\s*\/\s*\(?decrease|decrease\s*\/\s*\(?increase/i], cash_begin: [/beginning|opening|start of/i], cash_end: [/end of|closing/i],
+  capex: [/purchase of (property|fixed|plant|ppe|tangible)|acquisition of (property|fixed|tangible)|capital expenditure|additions to (property|fixed)/i] };
+const BF = Object.keys(ROWB), CF = Object.keys(ROWC);
+const decOf = vals => Math.min(4, Math.max(0, ...vals.filter(v => v != null && isFinite(+v)).map(v => { const t = String(v), i = t.indexOf("."); return i < 0 ? 0 : t.length - i - 1; })));
+const near2 = (x, y, n, d) => x != null && y != null && Math.abs(x - y) <= 0.5 * n * Math.pow(10, -d) + 1e-9;
+const isDay = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ""));
+// one balance-sheet column / cash-flow statement → checked in place: e.onPage, e.ok, e.why
+export function checkBsCf(R, pageOf, cands) {
+  const hitsOf = (e, F, rules, txt) => { const on = {}; let n = 0; for (const f of F) { if (e[f] == null) continue; on[f] = rowHit(e[f], txt, f, rules).ok; if (on[f]) n++; } return { on, n }; };
+  const place = (e, F, rules) => { let best = hitsOf(e, F, rules, pageOf(e.page)), at = null;
+    if (cands) for (const k of cands) { const r = hitsOf(e, F, rules, k.text); if (r.n > best.n) { best = r; at = k.p; } } if (at != null) e.page = at; return best.on; };
+  const pageText = e => cands ? ((cands.find(k => k.p === e.page) || { text: pageOf(e.page) }).text) : pageOf(e.page);
+  let ok = 0;
+  for (const e of R.bs || []) {
+    e.factor = unitFactor(e.unit); const on = e.onPage = place(e, BF, ROWB), d = decOf(BF.map(f => e[f])), v = f => (e[f] != null && on[f]) ? +e[f] : null;
+    const eq = v("share_capital") != null && v("other_equity") != null ? v("share_capital") + v("other_equity") : null;
+    if (v("equity") == null && eq != null) { e.equity_calc = Math.round(eq * 1e4) / 1e4; }                    // owners' equity = share capital + other equity, both found in their rows
+    const E = v("equity") != null ? v("equity") : e.equity_calc;
+    const eqOk = v("equity") != null ? (eq == null || near2(eq, v("equity"), 3, d)) : eq != null;
+    const teOk = v("total_equity") == null || E == null || near2(E + (v("nci") || 0), v("total_equity"), 3, d) || near2(E, v("total_equity"), 2, d);
+    const bOk = !/^cons/i.test(String(e.basis || "")) || /consolidated/i.test(pageText(e));
+    e.ok = !!(e.factor && isDay(e.date) && bOk && v("total_assets") != null && v("total_equity_liabilities") != null && near2(v("total_assets"), v("total_equity_liabilities"), 2, d) && E != null && eqOk && teOk);
+    e.why = e.ok ? undefined : !e.factor ? "unit" : !isDay(e.date) ? "date" : !bOk ? "basis" : v("total_assets") == null ? "total assets row" : v("total_equity_liabilities") == null ? "equity and liabilities row"
+      : !near2(v("total_assets"), v("total_equity_liabilities"), 2, d) ? "assets ≠ equity + liabilities" : E == null ? "equity row" : !eqOk ? "equity sum" : "total equity sum";
+    if (e.why === undefined) delete e.why; if (e.ok) ok++;
+  }
+  for (const e of R.cf || []) {
+    e.factor = unitFactor(e.unit); const on = e.onPage = place(e, CF, ROWC), d = decOf(CF.map(f => e[f])), v = f => (e[f] != null && on[f]) ? +e[f] : null;
+    const sum = v("cfo") != null && v("cfi") != null && v("cff") != null ? v("cfo") + v("cfi") + v("cff") : null;
+    const netOk = sum != null && (v("net_change") != null ? near2(sum, v("net_change"), 4, d) : (v("cash_begin") != null && v("cash_end") != null && near2(v("cash_begin") + sum, v("cash_end"), 5, d)));
+    const m = isDay(e.from) && isDay(e.to) ? Math.round((Date.parse(e.to) - Date.parse(e.from)) / (30.44 * 864e5)) : null; e.months = m;
+    const bOk = !/^cons/i.test(String(e.basis || "")) || /consolidated/i.test(pageText(e));
+    e.ok = !!(e.factor && (m === 6 || m === 12) && bOk && netOk);
+    e.why = e.ok ? undefined : !e.factor ? "unit" : !(m === 6 || m === 12) ? "period" : !bOk ? "basis" : sum == null ? "operating / investing / financing rows" : "cash sum";
+    if (e.why === undefined) delete e.why; if (e.ok) ok++;
+  }
+  return ok;
+}
+const SYSTEM_B = "You read the balance sheet (statement of assets and liabilities) and cash flow statement of Indian listed companies. Answer with JSON only. Copy every number exactly as printed (same unit, same decimals, no conversion, no rounding); write negatives / numbers in brackets with a minus sign; never guess — use null when a line is not printed.";
+const promptB = (co, pages) => `The attached document holds pages ${pages.map(p => p + 1).join(", ")} of the results PDF of ${co.name} (${co.code || "BSE code " + co.scrip}), in that order.
+Find the statement of assets and liabilities (balance sheet) and the cash flow statement — standalone and/or consolidated. Return:
+{"bs":[{"basis":"standalone"|"consolidated","unit":"exactly as printed, e.g. Rs. in Lakhs","date":"YYYY-MM-DD (the 'as at' date of the column)","page":<position of the page in the ATTACHED document: 1 = its first page>,"share_capital":n,"other_equity":n,"equity":n,"nci":n,"total_equity":n,"borrowings_noncurrent":n,"borrowings_current":n,"cash":n,"other_bank":n,"current_investments":n,"inventories":n,"trade_receivables":n,"trade_payables":n,"ppe":n,"cwip":n,"goodwill":n,"intangibles":n,"current_assets":n,"current_liabilities":n,"total_assets":n,"total_equity_liabilities":n}],
+"cf":[{"basis":"standalone"|"consolidated","unit":"as printed","from":"YYYY-MM-DD","to":"YYYY-MM-DD","page":n,"cfo":n,"cfi":n,"cff":n,"net_change":n,"cash_begin":n,"cash_end":n,"capex":n}]}
+One "bs" entry per balance-sheet column (each 'as at' date) and one "cf" entry per cash-flow period. share_capital = equity share capital; other_equity = other equity (reserves and surplus); equity = equity attributable to the owners as printed (null if no such line); nci = non-controlling interest; total_equity = total equity as printed; borrowings_noncurrent / borrowings_current = the "Borrowings" line under non-current / current financial liabilities; trade_payables = one printed total of trade payables (null when only the MSME / others lines are printed); current_assets / current_liabilities = their printed totals; total_assets = "Total assets"; total_equity_liabilities = "Total equity and liabilities". cfo / cfi / cff = net cash from (used in) operating / investing / financing activities; net_change = net increase / (decrease) in cash and cash equivalents; cash_begin / cash_end = cash and cash equivalents at the beginning / end of the period; capex = purchase of property, plant and equipment (as printed). Return {"bs":[],"cf":[]} when neither statement is in these pages.`;
+// the pages holding them (in the PDF's own text or the OCR readings), one more reading, the checks, OCR witnesses for misses
+export async function readBsCf(dir, file, co, ask, st, until, texts, o = {}) {
+  const T = (texts || []).map(t => [t || ""]), joined = i => (T[i] || []).filter(Boolean).join("\n");
+  const pick = pickBsCf(T.map((_, i) => joined(i))); if (!pick.length) return { bs: [], cf: [], why: "no balance sheet or cash flow pages" };
+  const doc = await attach(dir, file, pick, +o.maxPdf || MAXPDF);
+  const ans = await ask(SYSTEM_B, [...doc, { type: "text", text: promptB(co, pick) }], st);
+  let j = null; try { j = JSON.parse(String(ans.text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(ans.text); }
+  const R = { bs: (j && Array.isArray(j.bs) ? j.bs : []).slice(0, 8), cf: (j && Array.isArray(j.cf) ? j.cf : []).slice(0, 6) };
+  const at = n => pick[Math.max(0, Math.min(pick.length - 1, Math.round(+n || 1) - 1))] ?? 0;
+  const run = () => checkBsCf(R, n => joined(at(n)), pick.map((p, x) => ({ p: x + 1, text: joined(p) })));
+  run(); const seen = new Set();
+  for (const [dpi, psm] of [[300, 6], [300, 4], [300, 1]]) {                        // a number not found → that page read again by OCR (more witnesses)
+    const need = new Set([...R.bs, ...R.cf].filter(e => !e.ok).map(e => at(e.page))); if (!need.size || Date.now() > until) break; let fresh = 0;
+    for (const p of need) { const key = p + "/" + dpi + "/" + psm; if (seen.has(key)) continue; seen.add(key); const t = await ocrPage(dir, file, p, dpi, psm); if (t) { T[p].push(t); fresh++; } }
+    if (fresh) run(); }
+  for (const e of [...R.bs, ...R.cf]) e.page = at(e.page) + 1;                         // page of the original PDF
+  return { bs: R.bs, cf: R.cf, pick: pick.map(p => p + 1) };
+}
+// the results PDF of a September or March quarter (half-year / year) carries the balance sheet and the cash flow statement
+export const wantsBsCf = statements => (statements || []).some(s => (s.columns || []).some(c => c.ok && /-(03|09)-3[01]$/.test(String(c.end || ""))));
 export async function run(o = {}) {
   const T = o.trex || trex, ask = o.ask || ((sys, content, stt) => askClaude(fetch, CKEY, sys, content, null, stt)), get = o.getPdf || getPdf, say = o.log || log;
   const until = Date.now() + Math.max(1, +(o.minutes || process.env.TREX_BSEPILOT_MINUTES || 22)) * 60e3;      // the job has 30 minutes: no new PDF after this
@@ -291,14 +381,16 @@ export async function run(o = {}) {
     try {
       const got = await get(co.pdf); if (!got) { say(`  ${id}: could not download`); await T("bsefig", "", { scrip: co.scrip, pdf: co.pdf, ok: false, cost: 0, data: { rv: RV, arv: RV, err: "download failed", again: 1 } }); continue; }
       const file = join(dir, "a.pdf"); await writeFile(file, got.b);
-      const { best, nPages, ocr, tries, from } = await readPdf(dir, file, co, ask, st, until, o);
+      const { best, nPages, ocr, tries, from, texts } = await readPdf(dir, file, co, ask, st, until, o);
+      // (20 Nov 2026) September / March results: the balance sheet and cash flow pages too (one more reading, same kind of checks)
+      let bc = null; const runCost = (st.cost || 0) - c0; if (wantsBsCf(best.statements) && Date.now() < until && !(spent + runCost >= CAP - 0.05) && !(MCAP && spentM + runCost >= MCAP - 0.05)) { try { bc = await readBsCf(dir, file, co, ask, st, until, texts, o); } catch (e) { bc = { bs: [], cf: [], why: "reading failed" }; } }
       const cost = (st.cost || 0) - c0; spent += cost; spentM += cost; counted = true;
       const statements = best.statements, ck = best.ck;
       for (const s of statements) for (const c of s.columns || []) c.page = best.at(c.page) + 1;   // page of the original PDF
       const ok = statements.some(s => (s.columns || []).some(c => c.ok));
-      await T("bsefig", "", { scrip: co.scrip, pdf: co.pdf, model: best.model, cost, ok, data: { rv: RV, via: got.via, pages: nPages, read: best.pick.map(p => p + 1), ocr, wit: best.wit, tries, ...(from ? { from } : {}), statements, found: ck.found, numbers: ck.total, cols: ck.cols, okCols: ck.ok } });
+      await T("bsefig", "", { scrip: co.scrip, pdf: co.pdf, model: best.model, cost, ok, data: { rv: RV, via: got.via, pages: nPages, read: best.pick.map(p => p + 1), ocr, wit: best.wit, tries, ...(from ? { from } : {}), statements, found: ck.found, numbers: ck.total, cols: ck.cols, okCols: ck.ok, ...(bc ? { bs: bc.bs, cf: bc.cf, bsRead: bc.pick || null, ...(bc.why ? { bsWhy: bc.why } : {}) } : {}) } });
       docs++; if (ok) passed++;
-      say(`  ${id}: ${nPages} pages (${ocr.length ? "scanned / pictures, read by OCR" : "text"}), ${statements.length} statement(s), ${ck.found} of ${ck.total} numbers found in their rows, ${ck.ok} of ${ck.cols} columns passed${best.wit ? ` (read again by OCR ${best.wit}×)` : ""}${from ? ` — kept: the ${from}` : ""} — $${cost.toFixed(4)}`);
+      say(`  ${id}: ${nPages} pages (${ocr.length ? "scanned / pictures, read by OCR" : "text"}), ${statements.length} statement(s), ${ck.found} of ${ck.total} numbers found in their rows, ${ck.ok} of ${ck.cols} columns passed${best.wit ? ` (read again by OCR ${best.wit}×)` : ""}${from ? ` — kept: the ${from}` : ""}${bc ? ` · balance sheet ${(bc.bs || []).filter(e => e.ok).length}/${(bc.bs || []).length}, cash flow ${(bc.cf || []).filter(e => e.ok).length}/${(bc.cf || []).length} passed` : ""} — $${cost.toFixed(4)}`);
     } catch (e) { const cost = Math.max(0, (st.cost || 0) - c0); if (!counted) { spent += cost; spentM += cost; }
       say(`  ${id}: ${String(e.message || e).replace(/https?:\/\/\S+/g, "[link]").slice(0, 140)}`); if (e.fatal) break;
       // a read that failed (busy, no answer…): its cost is counted and T-Rex offers the PDF again — three tries at most

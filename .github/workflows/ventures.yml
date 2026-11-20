@@ -1,9 +1,12 @@
-# T-Rex · New ventures PILOT (owner's "go ahead", 20 Nov 2026): reads the latest call transcript + investor presentation of
-# 20 small/midcap companies (Time Technoplast and Ola Electric first) and lists their NEW business lines, each with a sentence
-# found on its page. Results go to T-Rex for Mr. T-Rex's review (/api/stepzero?what=vent). Run by hand only.
-# Money: T-Rex stops it at TREX_VENT_CAP ($1 by default) across all runs; this run also stops at TREX_VENT_BUDGET_USD.
-name: T-Rex new ventures pilot
+# T-Rex · New ventures (owner 20 Nov 2026: pilot OK, then "go ahead - use 10$"): reads the call transcripts (last 2), latest investor
+# presentation and latest annual report (2025 onwards) of every small and midcap (market-value ranks 101–1000) and lists their NEW business
+# lines, each step with a sentence found on its page. Results go to T-Rex (Announcements → New ventures, Business tab).
+# Runs every hour until every company is read by this reader version (each run ~50 min, 4 at a time); a run with nothing left costs nothing.
+# Money: T-Rex stops it at TREX_VENT_CAP ($10.20 = the owner's $10 + the $0.10 pilot) across all runs.
+name: T-Rex new ventures
 on:
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,7 +16,7 @@ concurrency:
 jobs:
   read:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,13 +24,16 @@ jobs:
           node-version: 22
       - name: Install PDF text tool
         run: for i in 1 2 3; do sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 && break; sudo apt-get update -qq || true; sleep 20; done; command -v pdftotext
-      - name: Find new business lines (pilot, caps below)
+      - name: Find new business lines (caps below)
         run: node collector/ventures.mjs
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || secrets.RESEARCH }}
           TREX_KEY: ${{ secrets.TREX_KEY }}
           DATA_KEY: ${{ secrets.DATA_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-          TREX_VENT_BUDGET_USD: "1"
-          TREX_VENT_N: "20"
+          TREX_VENT_BUDGET_USD: "10"
+          TREX_VENT_N: "1000"
+          TREX_VENT_RANKS: "101-1000"
+          TREX_VENT_MINUTES: "50"
+          TREX_VENT_PARALLEL: "4"
           TREX_VENT_SYMS: "TIMETECHNO,OLAELEC"

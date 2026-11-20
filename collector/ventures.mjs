@@ -69,11 +69,18 @@ export function ventKey(name) {
     .filter(w => w.length > 1 && !/^(own|new|the|and|for|with|in|of|house|production|products?|business|systems?|solutions?|platform)$/.test(w)).sort();
 }
 export function ventMerge(lines) {
-  const keep = [];
+  const keep = [], evOf = l => ({ stage: l.stage, quote: l.quote, page: l.page, doc: l.doc, type: l.type, date: l.date, nums: l.nums || [] });
   for (const l of lines) { const b = ventKey(l.line), i = keep.findIndex(m => { const a = new Set(ventKey(m.line)); return b.length && a.size && b.filter(w => a.has(w)).length / Math.min(a.size, b.length) >= 0.75; });
-    if (i < 0) keep.push(l); else if (VENT_STAGES.indexOf(l.stage) > VENT_STAGES.indexOf(keep[i].stage)) keep[i] = l; }
+    if (i < 0) { keep.push({ ...l, first: l.date || null, ev: l.ev ? [...l.ev] : [evOf(l)] }); continue; }
+    const k = keep[i], ev = [...k.ev, ...(l.ev || [evOf(l)])];
+    const top = VENT_STAGES.indexOf(l.stage) > VENT_STAGES.indexOf(k.stage) ? { ...l } : { ...k };
+    top.line = k.line; top.ev = ev; top.first = [k.first, l.first || l.date].filter(Boolean).sort((x, y) => docTime(x) - docTime(y))[0] || null; keep[i] = top; }
+  // evidence oldest first, at most 6 (the furthest step's own sentence always kept)
+  for (const k of keep) { const seen = new Set(); k.ev = k.ev.filter(e => { const q = e.quote ? String(e.quote).slice(0, 80) : `${e.stage}|${e.date}|${e.doc}`; if (seen.has(q)) return false; seen.add(q); return true; }).sort((a, b) => docTime(a.date) - docTime(b.date));
+    if (k.ev.length > 6) { const top = k.ev.find(e => e.quote === k.quote); k.ev = [...k.ev.slice(0, 5), ...(top && !k.ev.slice(0, 5).includes(top) ? [top] : [k.ev[k.ev.length - 1]])]; } }
   return keep;
 }
+export const VENT_RV = 3;   // reader version of the full run (companies read by an older version are read again)
 export function ventVerify(text, pagesSets, doc) {
   let j = null; try { j = JSON.parse(String(text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(text); }
   const raw = j && Array.isArray(j.lines) ? j.lines : [], out = []; let dropped = 0;
@@ -95,50 +102,52 @@ export function ventVerify(text, pagesSets, doc) {
 async function main() {
   const server = (process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, ""), KEY = process.env.TREX_KEY, CKEY = process.env.ANTHROPIC_API_KEY;
   const log = m => console.log(new Date().toISOString().slice(11, 19) + "  " + m);
-  if (!KEY || !CKEY) { log("New ventures pilot: TREX_KEY / ANTHROPIC_API_KEY missing."); return; }
-  const budget = +(process.env.TREX_VENT_BUDGET_USD || 1), N = +(process.env.TREX_VENT_N || 20);
+  if (!KEY || !CKEY) { log("New ventures: TREX_KEY / ANTHROPIC_API_KEY missing."); return; }
+  const budget = +(process.env.TREX_VENT_BUDGET_USD || 1), N = +(process.env.TREX_VENT_N || 1000);
   const trex = (action, qs = "", body) => fetch(`${server}/api/collect?action=${action}${qs}`, { method: "POST", headers: { "x-trex-key": KEY, ...(body ? { "x-trex-gz": "1" } : {}) }, body: body ? gzipSync(JSON.stringify(body)) : undefined, signal: AbortSignal.timeout(90000) }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
-  const stat = await trex("vent", "&stat=1"); if (!stat.ok) { log("New ventures pilot: T-Rex problem: " + stat.error); return; }
-  if (stat.stop) { log(`New ventures pilot: the cap of $${stat.cap} is used ($${stat.spent}) — nothing to do.`); return; }
+  const stat = await trex("vent", "&stat=1&rv=" + VENT_RV); if (!stat.ok) { log("New ventures: T-Rex problem: " + stat.error); return; }
+  if (stat.stop) { log(`New ventures: the cap of $${stat.cap} is used ($${stat.spent}) — nothing to do.`); return; }
   // the deep-reading files (read only)
   const dir = "ventdeep", repo = process.env.GITHUB_REPOSITORY, tok = process.env.GITHUB_TOKEN; rmSync(dir, { recursive: true, force: true });
   execFileSync("git", ["clone", "--quiet", "--depth", "1", "--branch", "deep-data", `https://x-access-token:${tok}@github.com/${repo}.git`, dir], { stdio: ["ignore", "pipe", "pipe"] });
   const loadCo = async s => { try { return await openText(readFileSync(join(dir, "d", s + ".json"), "utf8")); } catch (e) { return null; } };
-  // companies: the owner's examples first, then small and midcaps spread across the ranks
-  const rk = await trex("deeptargets2", "&from=101&to=1000"), ranked = (rk && rk.symbols) || [], rank = new Map(ranked.map((s, i) => [s, i + 101]));
-  const want = String(process.env.TREX_VENT_SYMS || "TIMETECHNO,OLAELEC").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-  const step = Math.max(1, Math.floor(ranked.length / (N * 2)));
-  const pool = [...want, ...ranked.filter((_, i) => i % step === 0)], picked = [];
-  const recent = Date.UTC(2025, 6, 1);
-  for (const s of pool) { if (picked.length >= N) break; if (picked.some(p => p.s === s) || !existsSync(join(dir, "d", s + ".json"))) continue;
+  // companies: ranks TREX_VENT_RANKS (small + midcaps), the owner's examples first; those already read by this reader version are skipped
+  const [r0, r1] = String(process.env.TREX_VENT_RANKS || "101-1000").split("-").map(Number);
+  const rk = await trex("deeptargets2", `&from=${r0}&to=${r1}`), ranked = (rk && rk.symbols) || [], rank = new Map(ranked.map((s, i) => [s, i + r0]));
+  const done = new Set(stat.done || []), want = String(process.env.TREX_VENT_SYMS || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  const pool = [...new Set([...want, ...ranked])].filter(s => !done.has(s)).slice(0, N), since = Date.UTC(2025, 0, 1), picked = [];
+  for (const s of pool) { if (!existsSync(join(dir, "d", s + ".json"))) continue;
     const co = await loadCo(s); if (!co || !Array.isArray(co.docs)) continue;
-    const ok = co.docs.filter(d => d.status === 1 && /transcript|presentation/i.test(d.type || "") && docTime(d.date) >= recent && /^https:\/\/\S+\.pdf$/i.test(d.doc || ""));
-    const tr = ok.filter(d => /transcript/i.test(d.type)).sort((a, b) => docTime(b.date) - docTime(a.date))[0], pr = ok.filter(d => /presentation/i.test(d.type)).sort((a, b) => docTime(b.date) - docTime(a.date))[0];
-    const docs = [tr, pr].filter(Boolean); if (docs.length) picked.push({ s, name: co.name || s, docs }); }
-  log(`New ventures pilot: ${picked.length} companies picked (cap $${stat.cap}, spent so far $${stat.spent}).`);
+    const ok = co.docs.filter(d => d.status === 1 && /transcript|presentation|annual report/i.test(d.type || "") && docTime(d.date) >= since && /^https:\/\/\S+\.pdf$/i.test(d.doc || "")).sort((a, b) => docTime(b.date) - docTime(a.date));
+    const docs = [...ok.filter(d => /transcript/i.test(d.type)).slice(0, 2), ...ok.filter(d => /presentation/i.test(d.type)).slice(0, 1), ...ok.filter(d => /annual report/i.test(d.type)).slice(0, 1)]
+      .sort((a, b) => docTime(a.date) - docTime(b.date));                                     // oldest first: the first mention is dated
+    picked.push({ s, name: co.name || s, docs }); }
+  log(`New ventures: ${picked.length} companies to read this run (${done.size} done; cap $${stat.cap}, spent $${stat.spent}).`);
   const curl = url => new Promise(res => { const tmp = join(tmpdir(), "vent-" + Date.now() + Math.random().toString(36).slice(2) + ".pdf");
     execFile("curl", ["-sSL", "--max-time", "90", "-A", UA, "-e", REF, "-o", tmp, "-w", "%{http_code}", url], { timeout: 100000 }, (e, out) => { let b = null; try { b = readFileSync(tmp); unlinkSync(tmp); } catch (x) {} res(!e && +String(out).trim() === 200 && b && b.length > 1000 ? b : null); }); });
   const getPdf = async url => { const b = await curl(url); if (b) return b;
     try { const r = await fetch(`${server}/api/collect?action=nsedoc&u=${encodeURIComponent(url)}`, { method: "POST", headers: { "x-trex-key": KEY }, signal: AbortSignal.timeout(120000) }); if (r.ok) { const x = Buffer.from(await r.arrayBuffer()); if (x.length > 1000) return x; } } catch (e) {} return null; };
-  const st = { inTok: 0, outTok: 0 }; let n = 0, kept = 0;
-  for (const c of picked) {
-    if ((st.cost || 0) >= budget) { log("New ventures pilot: this run's budget is used — stopping."); break; }
+  const st = { inTok: 0, outTok: 0 }; let n = 0, kept = 0, stop = false;
+  const until = Date.now() + (+process.env.TREX_VENT_MINUTES || 50) * 60e3;
+  async function one(c) {
     const c0 = st.cost || 0, lines = []; let raw = 0, dropped = 0, model = "", err = null;
     for (const d of c.docs) {
       const buf = await getPdf(d.doc); if (!buf) { err = "could not download a document"; continue; }
       let pages = [], pagesRaw = null; try { pages = await pdfTextPoppler(buf); pagesRaw = await pdfTextPoppler(buf, false); } catch (e) { err = "PDF unreadable"; continue; }
-      const sel = ventPages(pages); if (!sel.length) continue;
+      const sel = ventPages(pages, /annual report/i.test(d.type) ? 30000 : 24000); if (!sel.length) continue;
       const { system, prompt } = ventPrompt(c.name, c.s, d.type, d.date, sel);
-      let ans; try { ans = await askClaude(fetch, CKEY, system, prompt, null, st); } catch (e) { err = String(e.message || e).slice(0, 100); if (e.fatal || e.config) { log("New ventures pilot: Claude key problem — stopping."); return; } continue; }
+      let ans; try { ans = await askClaude(fetch, CKEY, system, prompt, null, st); } catch (e) { err = String(e.message || e).slice(0, 100); if (e.fatal || e.config) { log("New ventures: Claude key problem — stopping."); stop = true; return; } continue; }
       model = ans.model; const v = ventVerify(ans.text, [pagesRaw, pages], { url: d.doc, type: d.type, date: d.date }); raw += v.raw; dropped += v.dropped;
       lines.push(...v.lines);
     }
-    const merged = ventMerge(lines); lines.length = 0; lines.push(...merged);
-    const cost = Math.round(((st.cost || 0) - c0) * 1e5) / 1e5; n++; kept += lines.length;
-    const r = await trex("vent", "", { s: c.s, name: c.name, rank: rank.get(c.s) || null, docs: c.docs.map(d => ({ type: d.type, date: d.date })), lines, cost, model, raw, dropped, err });
-    log(`  company ${n}: ${lines.length} of ${raw} lines kept (${dropped} not a new business it makes or sells; the rest: quote found on the page), $${cost}`);
-    if (r && r.stop) { log("New ventures pilot: T-Rex says the cap is reached — stopping."); break; }
+    const merged = ventMerge(lines);
+    const cost = Math.round(((st.cost || 0) - c0) * 1e5) / 1e5; n++; kept += merged.length;
+    const r = await trex("vent", "", { s: c.s, name: c.name, rank: rank.get(c.s) || null, rv: VENT_RV, docs: c.docs.map(d => ({ type: d.type, date: d.date })), lines: merged, cost, model, raw, dropped, err });
+    if (n % 25 === 0) log(`  ${n} companies read, ${kept} lines kept, $${Math.round((st.cost || 0) * 1e4) / 1e4} this run`);
+    if (r && r.stop) { log("New ventures: T-Rex says the cap is reached — stopping."); stop = true; }
   }
-  log(`New ventures pilot: ${n} companies, ${kept} lines kept, $${Math.round((st.cost || 0) * 1e4) / 1e4} this run.`);
+  const queue = picked.slice(), par = Math.max(1, +process.env.TREX_VENT_PARALLEL || 4);
+  await Promise.all(Array.from({ length: par }, async () => { while (queue.length && !stop && Date.now() < until && (st.cost || 0) < budget) await one(queue.shift()); }));
+  log(`New ventures: ${n} companies read, ${kept} lines kept, $${Math.round((st.cost || 0) * 1e4) / 1e4} this run; ${queue.length} left for the next run.`);
 }
 if (process.argv[1] && process.argv[1].endsWith("ventures.mjs")) main();

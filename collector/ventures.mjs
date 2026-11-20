@@ -62,6 +62,18 @@ ${sel.map(p => `\n=== PAGE ${p.page} ===\n${p.text}`).join("\n")}`;
   return { system, prompt };
 }
 // keep a line only when its quote is found in the document; numbers only when written in that quote
+// the same line said twice — in one document or across the transcript and the presentation ("LFP cells" / "In-house LFP cells",
+// "Indrajal" / "Indrajaal", "CAR T-cell" / "CAR-T cell"): one line, the furthest step kept
+export function ventKey(name) {
+  return String(name || "").toLowerCase().replace(/[-–/]/g, " ").replace(/[^a-z0-9 ]/g, " ").replace(/([a-z])\1+/g, "$1").split(/\s+/)
+    .filter(w => w.length > 1 && !/^(own|new|the|and|for|with|in|of|house|production|products?|business|systems?|solutions?|platform)$/.test(w)).sort();
+}
+export function ventMerge(lines) {
+  const keep = [];
+  for (const l of lines) { const b = ventKey(l.line), i = keep.findIndex(m => { const a = new Set(ventKey(m.line)); return b.length && a.size && b.filter(w => a.has(w)).length / Math.min(a.size, b.length) >= 0.75; });
+    if (i < 0) keep.push(l); else if (VENT_STAGES.indexOf(l.stage) > VENT_STAGES.indexOf(keep[i].stage)) keep[i] = l; }
+  return keep;
+}
 export function ventVerify(text, pagesSets, doc) {
   let j = null; try { j = JSON.parse(String(text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(text); }
   const raw = j && Array.isArray(j.lines) ? j.lines : [], out = []; let dropped = 0;
@@ -76,11 +88,7 @@ export function ventVerify(text, pagesSets, doc) {
       what: String(x.what || "").slice(0, 240), quote: f.quote, page: f.page, doc: doc.url, type: doc.type, date: doc.date,
       nums: (Array.isArray(x.nums) ? x.nums : []).filter(n => n && n.v != null && String(n.v).trim() && q.includes(digits(n.v))).slice(0, 6) });
   }
-  // the same line said twice (e.g. "LFP cells" and "Own LFP cell production"): the furthest step is kept
-  const key = l => l.line.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(w => w.length > 2 && !/^(own|new|the|and|for|with|production|products?|business|systems?)$/.test(w)).sort().join(" ");
-  const keep = [];
-  for (const l of out) { const k = key(l), i = keep.findIndex(m => { const a = new Set(key(m).split(" ")), b = k.split(" "); return b.length && b.filter(w => a.has(w)).length / Math.max(1, Math.min(a.size, b.length)) >= 0.75; });
-    if (i < 0) keep.push(l); else if (VENT_STAGES.indexOf(l.stage) > VENT_STAGES.indexOf(keep[i].stage)) keep[i] = l; }
+  const keep = ventMerge(out);
   return { raw: raw.length, dropped, lines: keep };
 }
 
@@ -123,8 +131,9 @@ async function main() {
       const { system, prompt } = ventPrompt(c.name, c.s, d.type, d.date, sel);
       let ans; try { ans = await askClaude(fetch, CKEY, system, prompt, null, st); } catch (e) { err = String(e.message || e).slice(0, 100); if (e.fatal || e.config) { log("New ventures pilot: Claude key problem — stopping."); return; } continue; }
       model = ans.model; const v = ventVerify(ans.text, [pagesRaw, pages], { url: d.doc, type: d.type, date: d.date }); raw += v.raw; dropped += v.dropped;
-      for (const l of v.lines) if (!lines.some(x => x.line.toLowerCase() === l.line.toLowerCase())) lines.push(l);
+      lines.push(...v.lines);
     }
+    const merged = ventMerge(lines); lines.length = 0; lines.push(...merged);
     const cost = Math.round(((st.cost || 0) - c0) * 1e5) / 1e5; n++; kept += lines.length;
     const r = await trex("vent", "", { s: c.s, name: c.name, rank: rank.get(c.s) || null, docs: c.docs.map(d => ({ type: d.type, date: d.date })), lines, cost, model, raw, dropped, err });
     log(`  company ${n}: ${lines.length} of ${raw} lines kept (${dropped} not a new business it makes or sells; the rest: quote found on the page), $${cost}`);

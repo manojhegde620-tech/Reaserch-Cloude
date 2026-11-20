@@ -102,20 +102,25 @@ export function ventVerify(text, pagesSets, doc) {
 // CLEAN-UP (owner 20 Nov 2026, "yes, add the clean-up"): one short question per company over the lines ALREADY saved (no documents read
 // again): which lines are the same thing said in different words (folded into one), and which are the company's long-standing business
 // rather than something new (hidden with the reason). Lines are only folded or hidden — never reworded — so nothing new can be made up.
-export const VENT_TV = 1;
+export const VENT_TV = 2;   // v2 (20 Nov 2026): names the core business first, then hides lines inside it (v1 kept Mazagon Dock's ONGC offshore orders)
 export function ventTidyPrompt(company, symbol, lines) {
   const system = "You tidy a list of new business lines found in an Indian listed company's own documents, for investors. Reply with JSON only.";
   const prompt = `Company: ${company} (NSE: ${symbol}).
 These lines were found in its call transcripts, investor presentation and annual report (2025 onwards), each with the company's own sentences:
 ${lines.map(l => `${l.k}: "${l.line}" (${l.theme}, step: ${l.stage}${l.kind ? ", " + l.kind : ""})${l.what ? " — " + l.what : ""}\n   sentences: ${l.quotes.map(q => `"${q}"`).join(" | ")}`).join("\n")}
-Two tasks:
+Three tasks:
 1. "same": groups of keys that are clearly the SAME product, project or business described in different words (e.g. "5 GWh battery
    assembly plant" and "5 GWh BESS assembly facility"; "multipurpose cargo vessels for a European client" and "multipurpose vessel for
    Denmark client"). Put the clearest name first. Do NOT group lines that are only related (e.g. "LFP cells" and "battery packs").
-2. "old": keys that are NOT new for this company: its long-established core business, or ordinary orders, customers or capacity in a
-   business it has been in for many years (e.g. a shipbuilder's offshore orders from a long-time customer, a bank's lending, a drug
-   maker's routine new launches in markets it already sells in). Give a short reason. Only when you are confident; when unsure, leave it out.
-Reply as {"same":[["L0","L3"]],"old":[{"k":"L2","why":""}]} — empty lists when nothing applies.`;
+2. "core": first write one sentence naming the businesses this company has been in for many years (from what you know of the company
+   and from these sentences).
+3. "old": keys that are NOT new for this company: the same kind of product or service, for the same kind of customers, as that
+   long-established core business — even when the order, project, plant or customer itself is new. Examples: a shipbuilder that has built
+   offshore platforms and vessels for ONGC for decades winning more ONGC offshore orders; a bank's new loan products; a drug maker's routine
+   new generic launches in markets it already sells in; a cable maker's bigger cable plant. A line stays (not "old") when it is a product
+   category, technology or customer industry the company was not in before (e.g. a defence shipbuilder's first commercial cargo ships, a
+   cylinder maker's first hydrogen cylinders). Give a short reason. When unsure, leave it out.
+Reply as {"same":[["L0","L3"]],"core":"","old":[{"k":"L2","why":""}]} — empty lists when nothing applies.`;
   return { system, prompt };
 }
 // only keys that exist; a key in at most one group; reasons kept short

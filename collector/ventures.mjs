@@ -99,14 +99,66 @@ export function ventVerify(text, pagesSets, doc) {
   return { raw: raw.length, dropped, lines: keep };
 }
 
+// CLEAN-UP (owner 20 Nov 2026, "yes, add the clean-up"): one short question per company over the lines ALREADY saved (no documents read
+// again): which lines are the same thing said in different words (folded into one), and which are the company's long-standing business
+// rather than something new (hidden with the reason). Lines are only folded or hidden — never reworded — so nothing new can be made up.
+export const VENT_TV = 1;
+export function ventTidyPrompt(company, symbol, lines) {
+  const system = "You tidy a list of new business lines found in an Indian listed company's own documents, for investors. Reply with JSON only.";
+  const prompt = `Company: ${company} (NSE: ${symbol}).
+These lines were found in its call transcripts, investor presentation and annual report (2025 onwards), each with the company's own sentences:
+${lines.map(l => `${l.k}: "${l.line}" (${l.theme}, step: ${l.stage}${l.kind ? ", " + l.kind : ""})${l.what ? " — " + l.what : ""}\n   sentences: ${l.quotes.map(q => `"${q}"`).join(" | ")}`).join("\n")}
+Two tasks:
+1. "same": groups of keys that are clearly the SAME product, project or business described in different words (e.g. "5 GWh battery
+   assembly plant" and "5 GWh BESS assembly facility"; "multipurpose cargo vessels for a European client" and "multipurpose vessel for
+   Denmark client"). Put the clearest name first. Do NOT group lines that are only related (e.g. "LFP cells" and "battery packs").
+2. "old": keys that are NOT new for this company: its long-established core business, or ordinary orders, customers or capacity in a
+   business it has been in for many years (e.g. a shipbuilder's offshore orders from a long-time customer, a bank's lending, a drug
+   maker's routine new launches in markets it already sells in). Give a short reason. Only when you are confident; when unsure, leave it out.
+Reply as {"same":[["L0","L3"]],"old":[{"k":"L2","why":""}]} — empty lists when nothing applies.`;
+  return { system, prompt };
+}
+// only keys that exist; a key in at most one group; reasons kept short
+export function ventTidyCheck(text, keys) {
+  let j = null; try { j = JSON.parse(String(text).replace(/^[^{]*/, "").replace(/[^}]*$/, "")); } catch (e) { j = salvageJson(text); }
+  if (!j || typeof j !== "object") return null;
+  const K = new Set(keys), used = new Set(), groups = [], old = [];
+  for (const g of Array.isArray(j.same) ? j.same : []) { const ks = [...new Set((Array.isArray(g) ? g : []).map(String))].filter(k => K.has(k) && !used.has(k));
+    if (ks.length >= 2) { ks.forEach(k => used.add(k)); groups.push(ks); } }
+  for (const x of Array.isArray(j.old) ? j.old : []) { const k = String((x && x.k) || ""); if (K.has(k) && !old.some(o => o.k === k)) old.push({ k, why: String((x && x.why) || "").slice(0, 120) }); }
+  return { groups, old };
+}
+
 async function main() {
   const server = (process.env.TREX_SERVER || "https://t-rex-cloude.manojhegde620.workers.dev").replace(/\/$/, ""), KEY = process.env.TREX_KEY, CKEY = process.env.ANTHROPIC_API_KEY;
   const log = m => console.log(new Date().toISOString().slice(11, 19) + "  " + m);
   if (!KEY || !CKEY) { log("New ventures: TREX_KEY / ANTHROPIC_API_KEY missing."); return; }
   const budget = +(process.env.TREX_VENT_BUDGET_USD || 1), N = +(process.env.TREX_VENT_N || 1000);
   const trex = (action, qs = "", body) => fetch(`${server}/api/collect?action=${action}${qs}`, { method: "POST", headers: { "x-trex-key": KEY, ...(body ? { "x-trex-gz": "1" } : {}) }, body: body ? gzipSync(JSON.stringify(body)) : undefined, signal: AbortSignal.timeout(90000) }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
-  const stat = await trex("vent", "&stat=1&rv=" + VENT_RV); if (!stat.ok) { log("New ventures: T-Rex problem: " + stat.error); return; }
-  if (stat.stop) { log(`New ventures: the cap of $${stat.cap} is used ($${stat.spent}) — nothing to do.`); return; }
+  const stat = await trex("vent", `&stat=1&rv=${VENT_RV}&tv=${VENT_TV}`); if (!stat.ok) { log("New ventures: T-Rex problem: " + stat.error); return; }
+  const st = { inTok: 0, outTok: 0, cost: 0 }; let tidyStop = !stat.tidy || stat.tidy.stop, tidied = 0, tidyCost = 0;
+  // (20 Nov 2026) each company's cost is counted on its OWN counter: with 4 companies read at once, "run total after − before" also
+  // caught the other three's spend (run #3 counted ~4× the real cost). The run total is the sum of the companies' own counters.
+  const own = () => { const c = Object.create(st); c.cost = 0; c.inTok = 0; c.outTok = 0; return c; };
+  const add = c => { st.cost += c.cost; st.inTok += c.inTok; st.outTok += c.outTok; if (c.models && !st.models) { st.models = c.models; st.modelList = c.modelList; } if (c.noTemp && !st.noTemp) st.noTemp = c.noTemp; };
+  // the clean-up of one company: its saved lines (given, or read back from T-Rex) → one short question → fold / hide
+  async function tidyOne(s, name, given) {
+    if (tidyStop) return;
+    let L = given; if (!L) { const g = await trex("vent", "&get=" + encodeURIComponent(s)); if (!g || !g.ok) return; L = g.lines || []; name = g.name || name || s; }
+    let groups = [], old = [], cost = 0;
+    if (L.length) { const { system, prompt } = ventTidyPrompt(name || s, s, L), cs = own(); let ans = null;
+      try { ans = await askClaude(fetch, CKEY, system, prompt, null, cs); } catch (e) { if (e.fatal || e.config) { tidyStop = true; } }
+      add(cs); cost = Math.round(cs.cost * 1e5) / 1e5; tidyCost += cs.cost;
+      const ck = ans && ventTidyCheck(ans.text, L.map(l => l.k)); if (!ck) return;           // no usable answer: tried again next run
+      groups = ck.groups; old = ck.old; }
+    const r = await trex("vent", "&tidy=1", { s, tv: VENT_TV, groups, old, cost }); if (r && r.ok) tidied++; if (r && r.stop) { tidyStop = true; log("New ventures: the clean-up cap is reached."); }
+  }
+  // first the clean-up of companies read before it existed (no documents: a few minutes)
+  const untidy = (stat.untidy || []).slice(), tUntil = Date.now() + 15 * 60e3;
+  if (untidy.length && !tidyStop) { log(`New ventures: cleaning up ${untidy.length} companies already read (cap $${stat.tidy.cap}, spent $${stat.tidy.spent}).`);
+    await Promise.all(Array.from({ length: 4 }, async () => { while (untidy.length && !tidyStop && Date.now() < tUntil) await tidyOne(untidy.shift()); }));
+    log(`  cleaned ${tidied} companies, $${Math.round(tidyCost * 1e4) / 1e4}.`); }
+  if (stat.stop) { log(`New ventures: the reading cap of $${stat.cap} is used ($${stat.spent}) — nothing more to read.`); return; }
   // the deep-reading files (read only)
   const dir = "ventdeep", repo = process.env.GITHUB_REPOSITORY, tok = process.env.GITHUB_TOKEN; rmSync(dir, { recursive: true, force: true });
   execFileSync("git", ["clone", "--quiet", "--depth", "1", "--branch", "deep-data", `https://x-access-token:${tok}@github.com/${repo}.git`, dir], { stdio: ["ignore", "pipe", "pipe"] });
@@ -127,27 +179,30 @@ async function main() {
     execFile("curl", ["-sSL", "--max-time", "90", "-A", UA, "-e", REF, "-o", tmp, "-w", "%{http_code}", url], { timeout: 100000 }, (e, out) => { let b = null; try { b = readFileSync(tmp); unlinkSync(tmp); } catch (x) {} res(!e && +String(out).trim() === 200 && b && b.length > 1000 ? b : null); }); });
   const getPdf = async url => { const b = await curl(url); if (b) return b;
     try { const r = await fetch(`${server}/api/collect?action=nsedoc&u=${encodeURIComponent(url)}`, { method: "POST", headers: { "x-trex-key": KEY }, signal: AbortSignal.timeout(120000) }); if (r.ok) { const x = Buffer.from(await r.arrayBuffer()); if (x.length > 1000) return x; } } catch (e) {} return null; };
-  const st = { inTok: 0, outTok: 0 }; let n = 0, kept = 0, stop = false;
+  let n = 0, kept = 0, stop = false;
   const until = Date.now() + (+process.env.TREX_VENT_MINUTES || 50) * 60e3;
   async function one(c) {
-    const c0 = st.cost || 0, lines = []; let raw = 0, dropped = 0, model = "", err = null;
+    const cs = own(), lines = []; let raw = 0, dropped = 0, model = "", err = null;
     for (const d of c.docs) {
       const buf = await getPdf(d.doc); if (!buf) { err = "could not download a document"; continue; }
       let pages = [], pagesRaw = null; try { pages = await pdfTextPoppler(buf); pagesRaw = await pdfTextPoppler(buf, false); } catch (e) { err = "PDF unreadable"; continue; }
       const sel = ventPages(pages, /annual report/i.test(d.type) ? 30000 : 24000); if (!sel.length) continue;
       const { system, prompt } = ventPrompt(c.name, c.s, d.type, d.date, sel);
-      let ans; try { ans = await askClaude(fetch, CKEY, system, prompt, null, st); } catch (e) { err = String(e.message || e).slice(0, 100); if (e.fatal || e.config) { log("New ventures: Claude key problem — stopping."); stop = true; return; } continue; }
+      let ans; try { ans = await askClaude(fetch, CKEY, system, prompt, null, cs); } catch (e) { err = String(e.message || e).slice(0, 100); if (e.fatal || e.config) { log("New ventures: Claude key problem — stopping."); stop = true; add(cs); return; } continue; }
       model = ans.model; const v = ventVerify(ans.text, [pagesRaw, pages], { url: d.doc, type: d.type, date: d.date }); raw += v.raw; dropped += v.dropped;
       lines.push(...v.lines);
     }
     const merged = ventMerge(lines);
-    const cost = Math.round(((st.cost || 0) - c0) * 1e5) / 1e5; n++; kept += merged.length;
+    add(cs); const cost = Math.round(cs.cost * 1e5) / 1e5; n++; kept += merged.length;
     const r = await trex("vent", "", { s: c.s, name: c.name, rank: rank.get(c.s) || null, rv: VENT_RV, docs: c.docs.map(d => ({ type: d.type, date: d.date })), lines: merged, cost, model, raw, dropped, err });
-    if (n % 25 === 0) log(`  ${n} companies read, ${kept} lines kept, $${Math.round((st.cost || 0) * 1e4) / 1e4} this run`);
+    if (n % 25 === 0) log(`  ${n} companies read, ${kept} lines kept, $${Math.round(st.cost * 1e4) / 1e4} this run (clean-up $${Math.round(tidyCost * 1e4) / 1e4})`);
     if (r && r.stop) { log("New ventures: T-Rex says the cap is reached — stopping."); stop = true; }
+    // then its clean-up, on the lines exactly as T-Rex saved them (keys L0.., at most 12)
+    if (r && r.ok && merged.length) await tidyOne(c.s, c.name, merged.slice(0, 12).map((l, i) => ({ k: "L" + i, line: l.line, theme: l.theme, stage: l.stage, kind: l.kind, what: l.what,
+      quotes: [...new Set((l.ev && l.ev.length ? l.ev : [l]).map(e => String(e.quote || "").slice(0, 300)).filter(Boolean))].slice(0, 3) })));
   }
   const queue = picked.slice(), par = Math.max(1, +process.env.TREX_VENT_PARALLEL || 4);
-  await Promise.all(Array.from({ length: par }, async () => { while (queue.length && !stop && Date.now() < until && (st.cost || 0) < budget) await one(queue.shift()); }));
-  log(`New ventures: ${n} companies read, ${kept} lines kept, $${Math.round((st.cost || 0) * 1e4) / 1e4} this run; ${queue.length} left for the next run.`);
+  await Promise.all(Array.from({ length: par }, async () => { while (queue.length && !stop && Date.now() < until && st.cost < budget) await one(queue.shift()); }));
+  log(`New ventures: ${n} companies read, ${kept} lines kept, ${tidied} cleaned up; $${Math.round(st.cost * 1e4) / 1e4} this run (clean-up $${Math.round(tidyCost * 1e4) / 1e4}); ${queue.length} left for the next run.`);
 }
 if (process.argv[1] && process.argv[1].endsWith("ventures.mjs")) main();
